@@ -19,6 +19,7 @@ export interface RunOptions {
   isolation: IsolationMode;
   terminate: boolean;
   adminUrl?: string;
+  adminNote?: string;
   onlyRelated: boolean;
   checksOnly: boolean;
   dryRun: boolean;
@@ -122,7 +123,7 @@ export async function run(o: RunOptions): Promise<RunOutput> {
   });
   try {
     model.isolation = iso.mode;
-    model.notes = iso.notes.map((n) => scrubSecrets(n, [o.dbUrl]));
+    model.notes = [...(o.adminNote ? [o.adminNote] : []), ...iso.notes].map((n) => scrubSecrets(n, [o.dbUrl]));
     if (iso.mode === 'in-place' && suite.prepare) {
       await suite.prepare(o.dbUrl);
       model.notes.push('Installed the pgTAP extension in your local database, because the psql runner needs it.');

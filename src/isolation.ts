@@ -106,13 +106,15 @@ export async function createIsolation(o: IsolationOptions): Promise<Isolation> {
     master = `${PREFIX}${process.pid}_tpl`;
     const created = await makeMaster(admin, sourceDb, master, owner, o.terminate, notes, Boolean(o.adminUrl));
     if (!created.ok) {
-      if (o.mode === 'template') {
-        throw new Error(
-          `Could not copy the database: ${created.reason}\n` +
-            `Drop --isolation template to fall back to in-place mode.`
-        );
-      }
-      return await inPlace(o.sourceUrl, notes, created.reason);
+      // In-place mode edits the user's own policies. A crash mid-run would leave them broken,
+      // so it is never a silent fallback: the user must ask for it.
+      throw new Error(
+        `Could not copy the database: ${created.reason}\n` +
+          `Fix it one of two ways:\n` +
+          `  1. Pass --admin-url with a superuser URL, used only to copy and drop databases.\n` +
+          `  2. Pass --isolation in-place. Each break is then applied to this database and put back. ` +
+          `A crash would leave a policy broken, so use it only on a throwaway local database.`
+      );
     }
     const masterUrl = withDatabase(o.sourceUrl, master);
     try {
@@ -235,7 +237,7 @@ async function makeMaster(
       ok: false,
       reason:
         `"${sourceDb}" still has connections that this role cannot close` +
-        (haveAdminUrl ? '' : ' (a local Supabase keeps a superuser cron connection open; --admin-url lets it be closed)')
+        (haveAdminUrl ? '' : ' (a local Supabase keeps a superuser cron connection open)')
     };
   } finally {
     if (blocked) await admin.query(`alter database ${qi(sourceDb)} with allow_connections true`).catch(() => {});

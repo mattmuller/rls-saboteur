@@ -1,8 +1,10 @@
 #!/usr/bin/env node
-import { readFileSync, writeFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import pg from 'pg';
 import { CONFIG_FILE, discoverDbUrl, readFileConfig, scrubSecrets } from './config.js';
-import { REMOTE_FLAG, remoteRefusal, resolveConnection, stripRedirectEnv } from './safety.js';
+import { REMOTE_FLAG, remoteRefusal, resolveConnection, stripRedirectEnv, urlIsLocal } from './safety.js';
 import { consoleReport, exitCode, jsonReport, markdownReport } from './report.js';
 import { run } from './run.js';
 import { discoverSuite } from './tests.js';
@@ -28,7 +30,7 @@ Options
   --jobs <n>            Breaks to run in parallel on database copies. Default: 2
   --threshold <pct>     Fail below this score. Default: 100
   --only-related        Per break, run only the test files that mention the table
-  --isolation <mode>    auto (default), template, or in-place
+  --isolation <mode>    template (default) or in-place. In-place edits your own database and is never chosen for you.
   --admin-url <url>     Superuser URL used only to copy and drop databases. A local Supabase keeps a
                         superuser cron connection open; with this, copies (and --jobs) work.
   --no-terminate        Do not close other connections to take the first copy. Falls back to in-place.
@@ -101,6 +103,27 @@ async function main(): Promise<number> {
   knownUrl.push(found.dbUrl, ...(adminUrl ? [adminUrl] : []));
   stripRedirectEnv();
 
+  // Zero-config: a local Supabase has a documented superuser (supabase_admin, local default
+  // password). It is not a secret. It is used only to copy and drop databases.
+  let adminNote: string | undefined;
+  let adminUrlFinal = adminUrl;
+  if (!adminUrlFinal && !v['no-terminate'] && existsSync(join(cwd, 'supabase', 'config.toml')) && urlIsLocal(found.dbUrl)) {
+    const u = new URL(found.dbUrl);
+    u.username = 'supabase_admin';
+    u.password = 'postgres';
+    const probe = new pg.Client({ connectionString: u.toString(), connectionTimeoutMillis: 3000 });
+    probe.on('error', () => {});
+    try {
+      await probe.connect();
+      adminUrlFinal = u.toString();
+      adminNote = 'Using the local Supabase superuser (supabase_admin, the CLI default) only to copy and drop databases.';
+    } catch {
+      /* not a local Supabase, or a changed password: carry on without */
+    } finally {
+      await probe.end().catch(() => {});
+    }
+  }
+
   const isolation = (v.isolation ?? 'auto') as IsolationMode;
   if (!['auto', 'template', 'in-place'].includes(isolation)) {
     process.stderr.write('--isolation must be auto, template or in-place\n');
@@ -122,7 +145,8 @@ async function main(): Promise<number> {
     timeoutMs: (v.timeout ? Number(v.timeout) : 600) * 1000,
     isolation,
     terminate: !v['no-terminate'],
-    adminUrl,
+    adminUrl: adminUrlFinal,
+    adminNote,
     onlyRelated: Boolean(v['only-related']),
     checksOnly: Boolean(v['checks-only']),
     dryRun: Boolean(v['dry-run']),
