@@ -35,7 +35,7 @@ function who(p: Policy): string {
 
 function parseExpr(text: string): Node | null {
   try {
-    const r = parse(text, { entry: 'expr', locationTracking: true } as any) as Node[];
+    const r = parse(text, { entry: 'expr', locationTracking: true } as any) as unknown as Node[];
     return r.length === 1 ? r[0] : null;
   } catch {
     return null;
