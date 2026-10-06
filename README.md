@@ -21,7 +21,7 @@ The `examples/demo` project is a small multi-tenant app (orgs, members, document
 
 ```
 $ cd examples/demo
-$ npx rls-saboteur
+$ npx rls-saboteur --admin-url postgres://supabase_admin:postgres@127.0.0.1:55322/postgres
 Database   postgres://127.0.0.1:55322/postgres  (local Supabase, found from supabase/config.toml)
 Tests      supabase/tests/*.sql  (pgTAP, run with supabase test db)
 Policies   12 on 4 tables in public
@@ -63,7 +63,7 @@ The other three misses are in `saboteur-report.md`. All six:
 **After.** The same project with the tests in `examples/demo/fixed/tests`, which add one test for each miss:
 
 ```
-$ npx rls-saboteur --tests-dir fixed/tests
+$ npx rls-saboteur --admin-url postgres://supabase_admin:postgres@127.0.0.1:55322/postgres --tests-dir fixed/tests
 Database   postgres://127.0.0.1:55322/postgres  (local Supabase, found from supabase/config.toml)
 Tests      fixed/tests/*.sql  (pgTAP, run with supabase test db)
 Policies   12 on 4 tables in public
