@@ -27,6 +27,7 @@ Tests      supabase/tests/*.sql  (pgTAP, run with supabase test db)
 Policies   12 on 4 tables in public
 Baseline   all 25 tests pass
 Sabotage   breaking each policy in turn and re-running the tests  (42 breaks, 2 at a time, on database copies)
+  note: Using the local Supabase superuser (supabase_admin, the CLI default) only to copy and drop databases.
   note: Closed 2 other connection(s) to "postgres" for a moment to copy it. Local services reconnect by themselves.
   caught  36 / 42
   MISSED   6 / 42  your tests still pass with these policies broken
@@ -69,6 +70,7 @@ Tests      fixed/tests/*.sql  (pgTAP, run with supabase test db)
 Policies   12 on 4 tables in public
 Baseline   all 31 tests pass
 Sabotage   breaking each policy in turn and re-running the tests  (42 breaks, 2 at a time, on database copies)
+  note: Using the local Supabase superuser (supabase_admin, the CLI default) only to copy and drop databases.
   note: Closed 2 other connection(s) to "postgres" for a moment to copy it. Local services reconnect by themselves.
   caught  42 / 42
   MISSED   0 / 42  your tests still pass with these policies broken
