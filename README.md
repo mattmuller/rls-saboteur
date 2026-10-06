@@ -21,7 +21,7 @@ The `examples/demo` project is a small multi-tenant app (orgs, members, document
 
 ```
 $ cd examples/demo
-$ npx rls-saboteur --admin-url postgres://supabase_admin:postgres@127.0.0.1:55322/postgres
+$ npx rls-saboteur
 Database   postgres://127.0.0.1:55322/postgres  (local Supabase, found from supabase/config.toml)
 Tests      supabase/tests/*.sql  (pgTAP, run with supabase test db)
 Policies   12 on 4 tables in public
@@ -63,7 +63,7 @@ The other three misses are in `saboteur-report.md`. All six:
 **After.** The same project with the tests in `examples/demo/fixed/tests`, which add one test for each miss:
 
 ```
-$ npx rls-saboteur --admin-url postgres://supabase_admin:postgres@127.0.0.1:55322/postgres --tests-dir fixed/tests
+$ npx rls-saboteur --tests-dir fixed/tests
 Database   postgres://127.0.0.1:55322/postgres  (local Supabase, found from supabase/config.toml)
 Tests      fixed/tests/*.sql  (pgTAP, run with supabase test db)
 Policies   12 on 4 tables in public
@@ -108,13 +108,11 @@ Score  100%   exit 0 (threshold 100%)
 
 Postgres refuses to copy a database while anyone else is connected to it. A running local Supabase always has connections open (auth, REST, realtime), so a direct copy fails with "source database is being accessed by other users".
 
-RLS Saboteur handles this once, at the start. It closes the other connections for about a second, makes the master template, and lets them reconnect. It prints a note when it did so. If your role cannot close them, or you pass `--no-terminate`, it falls back to **in-place mode**: it applies each break to your local database, runs the tests, and puts the policy back, one break at a time. In-place mode restores on Ctrl-C too.
+RLS Saboteur handles this once, at the start. It closes the other connections for about a second, makes the master template, and lets them reconnect. It prints a note when it did so.
 
-On a stock local Supabase stack there is one more catch. The cron scheduler keeps a connection open as a superuser, and the normal `postgres` role cannot close it. Without help, RLS Saboteur falls back to in-place mode and says why. Pass `--admin-url` with a superuser URL (on a local stack, `supabase_admin` with the same local password) and it uses that role only to copy and drop databases. Copies then work and `--jobs` runs in parallel. The demo output below was produced that way:
+A stock local Supabase stack has one more catch. The cron scheduler keeps a connection open as a superuser, and the normal `postgres` role cannot close it. So when the host is local and `supabase/config.toml` exists, RLS Saboteur tries the CLI's documented local superuser (`supabase_admin`, local default password) on the same host and port. It uses that role only to copy and drop databases, and prints one line saying so. If that login fails, pass your own with `--admin-url <superuser url>`.
 
-```sh
-npx rls-saboteur --admin-url postgres://supabase_admin:postgres@127.0.0.1:54322/postgres
-```
+If no copy can be made, it stops with exit 2 and names both fixes. It never falls back to **in-place mode** by itself. In-place mode applies each break to your own database and puts the policy back afterwards. A crash or `kill -9` mid-run would leave a policy broken, so you must ask for it with `--isolation in-place`, and only on a throwaway local database. It restores on Ctrl-C.
 
 On the demo project, 42 breaks took about 35 seconds on copies with `--jobs 2`, and about 90 seconds in place.
 
@@ -141,7 +139,7 @@ A `FAIL` makes the exit code 1.
 --jobs <n>            Breaks run in parallel on copies. Default: 2
 --threshold <pct>     Fail below this score. Default: 100
 --only-related        Per break, run only the test files that mention the table
---isolation <mode>    auto, template or in-place
+--isolation <mode>    template (default) or in-place. In-place is never chosen for you.
 --admin-url <url>     Superuser URL used only to copy and drop databases
 --tests-dir <dir>     Directory of pgTAP files. Default: supabase/tests
 --no-terminate        Do not close other connections for the first copy
@@ -210,7 +208,13 @@ It starts the database container only, runs the tool, writes the report to the j
 
 ## Related tools
 
-[rlsautotest](https://github.com/search?q=rlsautotest) and [SupaShield](https://github.com/search?q=SupaShield) generate RLS tests. Run RLS Saboteur on the result. Supabase's own `splinter` lints settings; it does not run your tests.
+- [SupaShield](https://github.com/Rodrigotari1/supashield) is a command-line tool that audits and lints RLS, maps access per role, snapshots policies, and exports pgTAP tests.
+- [rlsautotest](https://github.com/unitautogen/rlsautotest) generates a pgTAP suite and its seed data from your policies, including two-tenant isolation.
+- [rlsgrid](https://github.com/matte97p/rlsgrid) maps role, table and operation, then fuzzes cross-tenant reads and writes.
+- [splinter](https://github.com/supabase/splinter) is Supabase's own linter. It checks database settings and powers the Security Advisor.
+- [supabase-test-helpers](https://github.com/usebasejump/supabase-test-helpers) provides pgTAP helpers for signing in as a user inside a test.
+
+RLS Saboteur works on top of the tests that SupaShield and rlsautotest generate: generate a suite with one of them, then run RLS Saboteur to see which breaks that suite misses.
 
 ## Develop
 

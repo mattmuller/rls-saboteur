@@ -12,10 +12,10 @@ cd examples/demo
 supabase start -x gotrue,realtime,storage-api,imgproxy,kong,mailpit,postgrest,postgres-meta,studio,edge-runtime,logflare,vector,supavisor
 
 # before: 36 of 42 breaks caught, 6 missed
-npx rls-saboteur --admin-url postgres://supabase_admin:postgres@127.0.0.1:55322/postgres
+npx rls-saboteur
 
 # after: 42 of 42
-npx rls-saboteur --admin-url postgres://supabase_admin:postgres@127.0.0.1:55322/postgres --tests-dir fixed/tests
+npx rls-saboteur --tests-dir fixed/tests
 
 supabase stop --no-backup
 ```
