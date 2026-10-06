@@ -98,13 +98,10 @@ export async function run(o: RunOptions): Promise<RunOutput> {
     return { model, breaks };
   }
 
-  if (suite.mode === 'custom' || suite.mode === 'supabase' || suite.mode === 'psql') {
-    // Baseline on the real database.
+  // Baseline on the real database. The psql runner needs pgTAP, which the real database may not
+  // have, so it takes its baseline on a prepared copy below instead.
+  if (suite.mode !== 'psql') {
     o.progress('Running the tests once, unchanged...');
-    if (suite.mode === 'psql' && suite.prepare) {
-      // The psql runner needs pgTAP. Installing it on the user database would change it,
-      // so only check here; the copies get it installed.
-    }
     const base = await suite.run(o.dbUrl, { timeoutMs: o.timeoutMs });
     if (!base.ok) {
       model.couldNotCheck =
@@ -126,8 +123,18 @@ export async function run(o: RunOptions): Promise<RunOutput> {
   try {
     model.isolation = iso.mode;
     model.notes = iso.notes.map((n) => scrubSecrets(n, [o.dbUrl]));
-    if (iso.mode === 'template') {
+    if (iso.mode === 'in-place' && suite.prepare) {
+      await suite.prepare(o.dbUrl);
+      model.notes.push('Installed the pgTAP extension in your local database, because the psql runner needs it.');
+    }
+    if (iso.mode === 'template' || suite.mode === 'psql') {
       const copyBase = await iso.withPristine((url) => suite.run(url, { timeoutMs: o.timeoutMs }));
+      model.baselineAssertions ??= copyBase.assertions;
+      if (!copyBase.ok && suite.mode === 'psql') {
+        model.couldNotCheck = `the tests fail before any policy is broken. Fix them first.\n` + tail(copyBase.output, [o.dbUrl]);
+        model.durationMs = Date.now() - started;
+        return { model, breaks };
+      }
       if (!copyBase.ok) {
         model.couldNotCheck =
           'the tests pass on your database but fail on an unchanged copy of it. ' +

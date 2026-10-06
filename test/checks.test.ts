@@ -82,3 +82,16 @@ describe('score and exit code', () => {
     expect(exitCode(model(['caught'], { findings: [{ ...f, severity: 'WARN' }] }))).toBe(0);
   });
 });
+
+import { copyOwnerPid } from '../src/isolation.js';
+describe('stale copy sweep only touches names this tool made', () => {
+  it('recognises its own names', () => {
+    expect(copyOwnerPid('saboteur_123_tpl')).toBe(123);
+    expect(copyOwnerPid('saboteur_123_7')).toBe(123);
+  });
+  it('leaves everything else alone', () => {
+    expect(copyOwnerPid('saboteur_e2e_src_1')).toBeNull();
+    expect(copyOwnerPid('saboteur_backup')).toBeNull();
+    expect(copyOwnerPid('postgres')).toBeNull();
+  });
+});

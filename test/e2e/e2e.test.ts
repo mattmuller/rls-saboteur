@@ -57,6 +57,7 @@ afterAll(async () => {
   const admin = new pg.Client({ connectionString: base });
   await admin.connect();
   await admin.query(`drop database if exists ${dbName} with (force)`);
+  await admin.query('drop role if exists app_user').catch(() => {});
   await admin.end();
 });
 

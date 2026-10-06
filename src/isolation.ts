@@ -51,14 +51,20 @@ function pidAlive(pid: number): boolean {
   }
 }
 
+/** The pid in a database name this tool created, or null for any other name. */
+export function copyOwnerPid(datname: string): number | null {
+  const m = /^saboteur_(\d+)_(?:tpl|\d+)$/.exec(datname);
+  return m ? Number(m[1]) : null;
+}
+
 /** Drop copies left behind by earlier runs that died. Only copies whose owning process is gone. */
 export async function sweepStale(admin: pg.Client): Promise<number> {
   const res = await admin.query(`select datname from pg_database where datname like 'saboteur\\_%'`);
   let dropped = 0;
   for (const { datname } of res.rows as { datname: string }[]) {
     // Only databases this tool named: saboteur_<pid>_tpl or saboteur_<pid>_<n>.
-    const m = /^saboteur_(\d+)_(?:tpl|\d+)$/.exec(datname);
-    if (!m || pidAlive(Number(m[1]))) continue;
+    const pid = copyOwnerPid(datname);
+    if (pid === null || pidAlive(pid)) continue;
     try {
       await admin.query(`drop database if exists ${qi(datname)} with (force)`);
       dropped++;
