@@ -36,3 +36,30 @@ describe('reports never carry a secret', () => {
     }
   });
 });
+
+describe('redact and scrubSecrets edge cases', () => {
+  it('redact drops a query-string password and user info', async () => {
+    const { redact } = await import('../src/config.js');
+    const r = redact('postgres://u:pw@127.0.0.1:5432/db?password=hunter9&sslmode=disable');
+    expect(r).not.toContain('hunter9');
+    expect(r).not.toContain('pw@');
+    expect(r).toContain('127.0.0.1:5432/db');
+  });
+  it('masks a query-string password in free text', () => {
+    expect(scrubSecrets('see postgres://h/db?password=hunter9&x=1', [])).not.toContain('hunter9');
+  });
+  it('masks a password containing / and @', () => {
+    const out = scrubSecrets('error for postgres://u:p@ss/w@dbhost:5432/db failed', []);
+    expect(out).not.toContain('p@ss');
+    expect(out).not.toContain('ss/w');
+    expect(out).toContain('dbhost:5432/db');
+  });
+  it('masks sslpassword', () => {
+    const out = scrubSecrets('host=x sslpassword=topsecret1 sslkey=/k.pem', []);
+    expect(out).not.toContain('topsecret1');
+  });
+  it('removes a very short known password through the full-URL replacement', () => {
+    const url = 'postgres://u:ab@127.0.0.1:5432/db';
+    expect(scrubSecrets(`conn ${url} lost`, [url])).not.toContain(':ab@');
+  });
+});

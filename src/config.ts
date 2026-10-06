@@ -74,13 +74,19 @@ export function readFileConfig(cwd: string): FileConfig {
   return cfg;
 }
 
-/** Show a URL without its password. */
+/**
+ * Show a URL without credentials. User, password and the whole query string are
+ * dropped, because a query string can carry password=, sslpassword=, sslkey= and similar.
+ */
 export function redact(dbUrl: string): string {
   try {
     const u = new URL(dbUrl);
+    const hadQuery = u.search !== '';
     u.password = '';
     u.username = '';
-    return u.toString().replace('://', '://');
+    u.search = '';
+    u.hash = '';
+    return u.toString() + (hadQuery ? '?\u2026' : '');
   } catch {
     return '(database)';
   }
@@ -116,6 +122,9 @@ export function scrubSecrets(text: string, knownUrls: string[] = []): string {
     try {
       const pw = new URL(url).password;
       if (pw) {
+        // A bare password shorter than 3 characters would mangle ordinary text, so only
+        // longer ones are replaced on their own. Short ones are still removed above,
+        // because the full-URL replacement runs whatever the length.
         for (const form of new Set([pw, decodeURIComponent(pw)])) {
           if (form.length >= 3) out = out.split(form).join('***');
         }
@@ -124,7 +133,9 @@ export function scrubSecrets(text: string, knownUrls: string[] = []): string {
       /* not a URL */
     }
   }
-  out = out.replace(/(postgres(?:ql)?:\/\/)([^\s:@/]*):([^\s@/]*)@/gi, '$1$2:***@');
-  out = out.replace(/\b(PGPASSWORD|password)\s*=\s*('[^']*'|"[^"]*"|[^\s'"]+)/gi, '$1=***');
+  // Userinfo runs to the LAST @ before the host, so a password holding / or @ is covered.
+  out = out.replace(/(postgres(?:ql)?:\/\/)[^\s]*@(?=[^\s@]+(?:[/?\s]|$))/gi, '$1***@');
+  // Query-string and libpq keyword forms.
+  out = out.replace(/\b(PGPASSWORD|(?:ssl)?password|sslkey|sslcert)\s*=\s*('[^']*'|"[^"]*"|[^\s'"&]+)/gi, '$1=***');
   return out;
 }
