@@ -28,8 +28,10 @@ inputs:
     description: Breaks to run in parallel.
     default: '2'
   version:
-    description: Version of the rls-saboteur npm package to run.
-    default: 'latest'
+    description: >
+      Version of the rls-saboteur npm package to run. The default is the version this
+      release of the action ships with. The release step must keep it equal to package.json.
+    default: '0.1.0'
   extra-args:
     description: Extra command-line options for rls-saboteur.
     default: ''
@@ -51,13 +53,15 @@ runs:
 
     - uses: supabase/setup-cli@v1
       with:
-        version: latest
+        version: '2.117.0'
 
     - name: Start local Supabase
       if: ${{ inputs.start-supabase == 'true' }}
       shell: bash
       working-directory: ${{ inputs.working-directory }}
-      run: supabase start -x "${{ inputs.supabase-exclude }}"
+      env:
+        SABOTEUR_EXCLUDE: ${{ inputs.supabase-exclude }}
+      run: supabase start -x "$SABOTEUR_EXCLUDE"
 
     - name: Run RLS Saboteur
       id: run
@@ -73,9 +77,9 @@ runs:
       run: |
         args=(--threshold "$SABOTEUR_THRESHOLD" --schemas "$SABOTEUR_SCHEMAS" --jobs "$SABOTEUR_JOBS" --json-file saboteur-report.json)
         if [ -n "$SABOTEUR_TEST" ]; then args+=(--test "$SABOTEUR_TEST"); fi
+        read -r -a extra <<< "$SABOTEUR_EXTRA"
         set +e
-        # shellcheck disable=SC2086
-        npx --yes "rls-saboteur@${SABOTEUR_VERSION}" "${args[@]}" $SABOTEUR_EXTRA
+        npx --yes "rls-saboteur@${SABOTEUR_VERSION}" "${args[@]}" "${extra[@]}"
         code=$?
         set -e
         if [ -f saboteur-report.json ]; then
