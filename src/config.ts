@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { isLocalHost } from './safety.js';
+import { urlIsLocal } from './safety.js';
 
 const LOCAL_DEFAULT_PASSWORDS = new Set(['postgres', 'password', 'supabase']);
 
@@ -133,7 +133,7 @@ export function scrubSecrets(text: string, knownUrls: string[] = []): string {
         // replacing the bare word would erase "postgres" from ordinary text. Every other
         // password is replaced bare, whatever it equals and however short it is. The
         // full-URL replacement above has already run regardless.
-        const localDefault = LOCAL_DEFAULT_PASSWORDS.has(safeDecode(pw)) && isLocalHost(u.hostname.replace(/^\[|\]$/g, ''));
+        const localDefault = LOCAL_DEFAULT_PASSWORDS.has(safeDecode(pw)) && urlIsLocal(url);
         if (!localDefault) {
           for (const form of new Set([pw, safeDecode(pw)])) {
             if (form.length >= 3) out = out.split(form).join('***');

@@ -2,7 +2,7 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 import { CONFIG_FILE, discoverDbUrl, readFileConfig, scrubSecrets } from './config.js';
-import { REMOTE_FLAG, remoteRefusal } from './safety.js';
+import { REMOTE_FLAG, remoteRefusal, resolveConnection, stripRedirectEnv } from './safety.js';
 import { consoleReport, exitCode, jsonReport, markdownReport } from './report.js';
 import { run } from './run.js';
 import { discoverSuite } from './tests.js';
@@ -87,13 +87,19 @@ async function main(): Promise<number> {
   const file = readFileConfig(cwd);
   const found = discoverDbUrl(cwd, v['db-url']);
   knownUrl = [found.dbUrl, ...(v['admin-url'] ? [v['admin-url']] : [])];
+  const allowRemote = Boolean(v[REMOTE_FLAG.slice(2)]);
   const refusal =
-    remoteRefusal(found.dbUrl, Boolean(v[REMOTE_FLAG.slice(2)])) ??
-    (v['admin-url'] ? remoteRefusal(v['admin-url'], Boolean(v[REMOTE_FLAG.slice(2)])) : null);
+    remoteRefusal(found.dbUrl, allowRemote) ?? (v['admin-url'] ? remoteRefusal(v['admin-url'], allowRemote) : null);
   if (refusal) {
-    process.stderr.write(refusal + '\n');
+    process.stderr.write(scrubSecrets(refusal, knownUrl) + '\n');
     return 2;
   }
+  // From here on the guard and the connection use the same values: the host is written into the
+  // URL, and nothing in the environment can redirect it (psql and the Supabase CLI read it too).
+  found.dbUrl = resolveConnection(found.dbUrl).url;
+  const adminUrl = v['admin-url'] ? resolveConnection(v['admin-url']).url : undefined;
+  knownUrl.push(found.dbUrl, ...(adminUrl ? [adminUrl] : []));
+  stripRedirectEnv();
 
   const isolation = (v.isolation ?? 'auto') as IsolationMode;
   if (!['auto', 'template', 'in-place'].includes(isolation)) {
@@ -116,7 +122,7 @@ async function main(): Promise<number> {
     timeoutMs: (v.timeout ? Number(v.timeout) : 600) * 1000,
     isolation,
     terminate: !v['no-terminate'],
-    adminUrl: v['admin-url'],
+    adminUrl,
     onlyRelated: Boolean(v['only-related']),
     checksOnly: Boolean(v['checks-only']),
     dryRun: Boolean(v['dry-run']),

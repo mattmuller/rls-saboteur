@@ -44,6 +44,23 @@ beforeAll(async () => {
     create function whoami() returns uuid language sql stable as
       $$ select (nullif(current_setting('request.jwt.claims', true), '')::json ->> 'sub')::uuid $$;
   `);
+  // Four defects the catalogue checks must find: a policy caller without EXECUTE, a custom role that
+  // inherits anon, a column grant under a table grant, and current_user in a SECURITY DEFINER function.
+  await c.query(`
+    do $$ begin
+      if not exists (select 1 from pg_roles where rolname = 'anon') then create role anon nologin; end if;
+    end $$;
+    grant anon to app_user;
+    create function owner_is_app() returns boolean language plpgsql security definer as
+      $$ begin return current_user = 'app'; end $$;
+    revoke execute on function owner_is_app() from public;
+    grant execute on function owner_is_app() to app_user;
+    grant select (id) on docs to app_user;
+    create function no_exec() returns boolean language sql stable as $$ select true $$;
+    revoke execute on function no_exec() from public, app_user;
+    create policy "needs exec" on docs for select to app_user using (no_exec());
+    create policy "uses definer" on docs for select to app_user using (owner_is_app());
+  `);
   await c.query(`
     create policy "read own" on docs for select to app_user using (owner = whoami());
     create policy "insert own" on docs for insert to app_user with check (owner = whoami());
@@ -58,12 +75,13 @@ afterAll(async () => {
   await admin.connect();
   await admin.query(`drop database if exists ${dbName} with (force)`);
   await admin.query('drop role if exists app_user').catch(() => {});
+  await admin.query('drop role if exists anon').catch(() => {});
   await admin.end();
 });
 
 describe('rls-saboteur against a real database', () => {
-  it('catches what the tests assert and misses what they do not', () => {
-    if (!reachable) return; // no Postgres: nothing to prove here
+  it('catches what the tests assert and misses what they do not', (ctx) => {
+    if (!reachable) ctx.skip();
     const cli = join(root, 'dist', 'cli.js');
     const r = spawnSync(
       'node',
@@ -88,5 +106,22 @@ describe('rls-saboteur against a real database', () => {
     const left = spawnSync('psql', [url(dbName), '-X', '-A', '-t', '-c', "select count(*) from pg_policies where tablename = 'docs'"], { encoding: 'utf8' });
     expect(left.stdout.trim()).toBe('3');
     expect(readFileSync(join(root, 'e2e-report.md'), 'utf8')).toContain('Missed breaks');
+  });
+});
+
+describe('catalogue checks against a real database', () => {
+  it('finds each of the four defects exactly once', (ctx) => {
+    if (!reachable) ctx.skip();
+    const r = spawnSync('node', [join(root, 'dist', 'cli.js'), '--db-url', url(dbName), '--checks-only', '--json', '--report', join(root, 'e2e-report.md')], {
+      encoding: 'utf8',
+      cwd: root
+    });
+    const report = JSON.parse(r.stdout);
+    const count = (check: string) => report.findings.filter((f: { check: string }) => f.check === check).length;
+    expect(count('function-execute')).toBe(1);
+    expect(count('role-membership')).toBe(1);
+    expect(count('inert-column-grant')).toBe(1);
+    expect(count('definer-current-user')).toBe(1);
+    expect(r.status).toBe(1);
   });
 });

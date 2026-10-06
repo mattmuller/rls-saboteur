@@ -4,6 +4,7 @@ import { hostOf, isLocalHost, remoteRefusal } from '../src/safety.js';
 import { readDbPort } from '../src/config.js';
 import { containsWord } from '../src/tests.js';
 import { exitCode, score, type RunModel } from '../src/report.js';
+import { copyOwnerPid } from '../src/isolation.js';
 
 describe('current_user detection', () => {
   it('finds current_user used as code', () => {
@@ -83,7 +84,6 @@ describe('score and exit code', () => {
   });
 });
 
-import { copyOwnerPid } from '../src/isolation.js';
 describe('stale copy sweep only touches names this tool made', () => {
   it('recognises its own names', () => {
     expect(copyOwnerPid('saboteur_123_tpl')).toBe(123);
