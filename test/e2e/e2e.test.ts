@@ -20,6 +20,7 @@ const url = (db: string) => {
 const root = join(import.meta.dirname, '..', '..');
 
 let reachable = false;
+let createdAnon = false;
 
 beforeAll(async () => {
   const admin = new pg.Client({ connectionString: base });
@@ -32,6 +33,7 @@ beforeAll(async () => {
   }
   await admin.query(`drop database if exists ${dbName} with (force)`);
   await admin.query(`create database ${dbName}`);
+  createdAnon = (await admin.query("select 1 from pg_roles where rolname = 'anon'")).rowCount === 0;
   await admin.query(`do $$ begin if not exists (select 1 from pg_roles where rolname = 'app_user') then create role app_user; end if; end $$`);
   await admin.end();
   const c = new pg.Client({ connectionString: url(dbName) });
@@ -51,15 +53,19 @@ beforeAll(async () => {
       if not exists (select 1 from pg_roles where rolname = 'anon') then create role anon nologin; end if;
     end $$;
     grant anon to app_user;
+    do $$ begin
+      if not exists (select 1 from pg_roles where rolname = 'app_other') then create role app_other nologin; end if;
+    end $$;
+    grant select on docs to app_other;
     create function owner_is_app() returns boolean language plpgsql security definer as
       $$ begin return current_user = 'app'; end $$;
     revoke execute on function owner_is_app() from public;
-    grant execute on function owner_is_app() to app_user;
-    grant select (id) on docs to app_user;
+    grant execute on function owner_is_app() to app_other;
+    grant select (id) on docs to app_other;
     create function no_exec() returns boolean language sql stable as $$ select true $$;
-    revoke execute on function no_exec() from public, app_user;
-    create policy "needs exec" on docs for select to app_user using (no_exec());
-    create policy "uses definer" on docs for select to app_user using (owner_is_app());
+    revoke execute on function no_exec() from public, app_other;
+    create policy "needs exec" on docs for select to app_other using (no_exec());
+    create policy "uses definer" on docs for select to app_other using (owner_is_app());
   `);
   await c.query(`
     create policy "read own" on docs for select to app_user using (owner = whoami());
@@ -75,7 +81,9 @@ afterAll(async () => {
   await admin.connect();
   await admin.query(`drop database if exists ${dbName} with (force)`);
   await admin.query('drop role if exists app_user').catch(() => {});
-  await admin.query('drop role if exists anon').catch(() => {});
+  await admin.query('drop role if exists app_other').catch(() => {});
+  // Only drop anon if this test created it; a Supabase database has its own.
+  if (createdAnon) await admin.query('drop role if exists anon').catch(() => {});
   await admin.end();
 });
 
@@ -104,7 +112,7 @@ describe('rls-saboteur against a real database', () => {
 
     // The source database is left exactly as it was.
     const left = spawnSync('psql', [url(dbName), '-X', '-A', '-t', '-c', "select count(*) from pg_policies where tablename = 'docs'"], { encoding: 'utf8' });
-    expect(left.stdout.trim()).toBe('3');
+    expect(left.stdout.trim()).toBe('5'); // all policies still there
     expect(readFileSync(join(root, 'e2e-report.md'), 'utf8')).toContain('Missed breaks');
   });
 });
