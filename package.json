@@ -1,0 +1,24 @@
+{
+  "name": "rls-saboteur",
+  "version": "0.1.0",
+  "description": "Mutation testing for Postgres and Supabase Row Level Security. Breaks each policy on purpose and lists every break your tests missed.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Matt Muller <138638+mattmuller@users.noreply.github.com>",
+  "repository": { "type": "git", "url": "git+https://github.com/mattmuller/rls-saboteur.git" },
+  "homepage": "https://github.com/mattmuller/rls-saboteur",
+  "bugs": "https://github.com/mattmuller/rls-saboteur/issues",
+  "keywords": ["postgres", "supabase", "rls", "row-level-security", "mutation-testing", "pgtap"],
+  "bin": { "rls-saboteur": "dist/cli.js" },
+  "files": ["dist", "README.md", "LICENSE"],
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && chmod +x dist/cli.js",
+    "type-check": "tsc --noEmit",
+    "test": "vitest run",
+    "test:e2e": "vitest run --config vitest.e2e.config.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": { "pg": "^8.13.0", "pgsql-ast-parser": "^12.0.1" },
+  "devDependencies": { "@types/node": "^22.0.0", "@types/pg": "^8.11.0", "typescript": "^5.6.0", "vitest": "^2.1.0" }
+}

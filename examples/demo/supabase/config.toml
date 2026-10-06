@@ -1,0 +1,32 @@
+# Demo project for rls-saboteur. Ports are in the 55xxx range so it never
+# clashes with another local Supabase stack.
+project_id = "rls-saboteur-demo"
+
+[api]
+enabled = true
+port = 55321
+schemas = ["public"]
+
+[db]
+port = 55322
+shadow_port = 55320
+major_version = 17
+
+[db.seed]
+enabled = false
+
+[studio]
+enabled = false
+port = 55323
+
+[inbucket]
+enabled = false
+port = 55324
+
+[auth]
+enabled = true
+site_url = "http://localhost:3000"
+
+[analytics]
+enabled = false
+port = 55327

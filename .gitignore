@@ -1,0 +1,4 @@
+node_modules
+dist
+saboteur-report.*
+.DS_Store
