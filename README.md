@@ -20,13 +20,61 @@ The `examples/demo` project is a small multi-tenant app (orgs, members, document
 **Before.** The suite in `examples/demo/supabase/tests`:
 
 ```
-@@BEFORE@@
+$ cd examples/demo
+$ npx rls-saboteur
+Database   postgres://127.0.0.1:55322/postgres  (local Supabase, found from supabase/config.toml)
+Tests      supabase/tests/*.sql  (pgTAP, run with supabase test db)
+Policies   12 on 4 tables in public
+Baseline   all 25 tests pass
+Sabotage   breaking each policy in turn and re-running the tests  (42 breaks, 2 at a time, on database copies)
+  note: Closed 2 other connection(s) to "postgres" for a moment to copy it. Local services reconnect by themselves.
+  caught  36 / 42
+  MISSED   6 / 42  your tests still pass with these policies broken
+  MISSED  documents  "authors delete own documents"
+          USING (author_id = auth.uid())
+          break: USING replaced with true  → any authenticated deletes every row in the table, whatever tenant it belongs to
+          1 test file(s) mention documents, and none fails with this break.
+  MISSED  documents  "authors update own documents"
+          USING (author_id = auth.uid()) WITH CHECK (author_id = auth.uid())
+          break: USING replaced with true  → any authenticated updates every row in the table, whatever tenant it belongs to
+          1 test file(s) mention documents, and none fails with this break.
+  MISSED  invoices  "admins create invoices"
+          WITH CHECK (is_org_admin(org_id) AND (issued_by = auth.uid()))
+          break: WITH CHECK condition removed: issued_by = auth.uid()  → rows that fail this condition now pass the policy
+          1 test file(s) mention invoices, and none fails with this break.
+  ... 3 more in saboteur-report.md
+Checks without tests
+  ok    no problems found in grants, roles or functions
+Score  86%   exit 1 (threshold 100%)
+```
+
+The other three misses are in `saboteur-report.md`. All six:
+
+- public.documents "authors delete own documents": USING replaced with true
+- public.documents "authors update own documents": USING replaced with true
+- public.invoices "admins create invoices": WITH CHECK condition removed: issued_by = auth.uid()
+- public.invoices "admins update invoices": USING replaced with true
+- public.invoices "admins update invoices": WITH CHECK removed
+- public.members "members read co-members": USING replaced with true
+
+```
 ```
 
 **After.** The same project with the tests in `examples/demo/fixed/tests`, which add one test for each miss:
 
 ```
-@@AFTER@@
+$ npx rls-saboteur --tests-dir fixed/tests
+Database   postgres://127.0.0.1:55322/postgres  (local Supabase, found from supabase/config.toml)
+Tests      fixed/tests/*.sql  (pgTAP, run with supabase test db)
+Policies   12 on 4 tables in public
+Baseline   all 31 tests pass
+Sabotage   breaking each policy in turn and re-running the tests  (42 breaks, 2 at a time, on database copies)
+  note: Closed 2 other connection(s) to "postgres" for a moment to copy it. Local services reconnect by themselves.
+  caught  42 / 42
+  MISSED   0 / 42  your tests still pass with these policies broken
+Checks without tests
+  ok    no problems found in grants, roles or functions
+Score  100%   exit 0 (threshold 100%)
 ```
 
 ## What "breaking a policy" means
@@ -62,7 +110,13 @@ Postgres refuses to copy a database while anyone else is connected to it. A runn
 
 RLS Saboteur handles this once, at the start. It closes the other connections for about a second, makes the master template, and lets them reconnect. It prints a note when it did so. If your role cannot close them, or you pass `--no-terminate`, it falls back to **in-place mode**: it applies each break to your local database, runs the tests, and puts the policy back, one break at a time. In-place mode restores on Ctrl-C too.
 
-The demo stack runs only the database, so there is nothing to disconnect there.
+On a stock local Supabase stack there is one more catch. The cron scheduler keeps a connection open as a superuser, and the normal `postgres` role cannot close it. Without help, RLS Saboteur falls back to in-place mode and says why. Pass `--admin-url` with a superuser URL (on a local stack, `supabase_admin` with the same local password) and it uses that role only to copy and drop databases. Copies then work and `--jobs` runs in parallel. The demo output below was produced that way:
+
+```sh
+npx rls-saboteur --admin-url postgres://supabase_admin:postgres@127.0.0.1:54322/postgres
+```
+
+On the demo project, 42 breaks took about 35 seconds on copies with `--jobs 2`, and about 90 seconds in place.
 
 ## Checks that need no tests
 
@@ -72,7 +126,7 @@ These run on every invocation, and alone with `--checks-only`. They read the cat
 |---|---|
 | A policy calls a function its role cannot EXECUTE | Every query on the table fails for that role. A grep of the code cannot see it, because the caller is a policy. |
 | A custom role is a member of anon or authenticated | The role inherits everything, and every restriction on it stops meaning anything. |
-| A column-level grant under a table-level grant | Column privileges add to table privileges. The column grant or REVOKE changes nothing. |
+| A column-level grant under a table-level grant | Column privileges add to table privileges. The column grant or REVOKE changes nothing. A REVOKE leaves no trace in the catalogue, so the check reports the visible symptom: a role with a table-level privilege and column-level entries for the same privilege. |
 | `current_user` inside a SECURITY DEFINER function | It is always the function owner, never the caller, so the check always passes. |
 
 A `FAIL` makes the exit code 1.
@@ -88,6 +142,8 @@ A `FAIL` makes the exit code 1.
 --threshold <pct>     Fail below this score. Default: 100
 --only-related        Per break, run only the test files that mention the table
 --isolation <mode>    auto, template or in-place
+--admin-url <url>     Superuser URL used only to copy and drop databases
+--tests-dir <dir>     Directory of pgTAP files. Default: supabase/tests
 --no-terminate        Do not close other connections for the first copy
 --filter <text>       Only breaks whose id contains this text
 --checks-only         Only the checks that need no tests
