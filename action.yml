@@ -1,0 +1,96 @@
+name: RLS Saboteur
+description: Break each Postgres/Supabase RLS policy on purpose and fail the build when the tests do not notice.
+author: Matt Muller
+branding:
+  icon: shield
+  color: purple
+
+inputs:
+  threshold:
+    description: Fail when the score is below this percentage.
+    default: '100'
+  working-directory:
+    description: Directory that holds the supabase/ folder.
+    default: '.'
+  start-supabase:
+    description: Run `supabase start` first. Set to false if an earlier step already started the stack.
+    default: 'true'
+  supabase-exclude:
+    description: Containers `supabase start` should skip. The database alone is enough for pgTAP.
+    default: 'gotrue,realtime,storage-api,imgproxy,kong,mailpit,postgrest,postgres-meta,studio,edge-runtime,logflare,vector,supavisor'
+  test:
+    description: Custom test command. Default is `supabase test db`.
+    default: ''
+  schemas:
+    description: Comma-separated schemas to cover.
+    default: 'public'
+  jobs:
+    description: Breaks to run in parallel.
+    default: '2'
+  version:
+    description: Version of the rls-saboteur npm package to run.
+    default: 'latest'
+  extra-args:
+    description: Extra command-line options for rls-saboteur.
+    default: ''
+
+outputs:
+  score:
+    description: The score as a percentage.
+    value: ${{ steps.run.outputs.score }}
+  missed:
+    description: Number of missed breaks.
+    value: ${{ steps.run.outputs.missed }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+
+    - uses: supabase/setup-cli@v1
+      with:
+        version: latest
+
+    - name: Start local Supabase
+      if: ${{ inputs.start-supabase == 'true' }}
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: supabase start -x "${{ inputs.supabase-exclude }}"
+
+    - name: Run RLS Saboteur
+      id: run
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        SABOTEUR_THRESHOLD: ${{ inputs.threshold }}
+        SABOTEUR_TEST: ${{ inputs.test }}
+        SABOTEUR_SCHEMAS: ${{ inputs.schemas }}
+        SABOTEUR_JOBS: ${{ inputs.jobs }}
+        SABOTEUR_VERSION: ${{ inputs.version }}
+        SABOTEUR_EXTRA: ${{ inputs.extra-args }}
+      run: |
+        args=(--threshold "$SABOTEUR_THRESHOLD" --schemas "$SABOTEUR_SCHEMAS" --jobs "$SABOTEUR_JOBS" --json-file saboteur-report.json)
+        if [ -n "$SABOTEUR_TEST" ]; then args+=(--test "$SABOTEUR_TEST"); fi
+        set +e
+        # shellcheck disable=SC2086
+        npx --yes "rls-saboteur@${SABOTEUR_VERSION}" "${args[@]}" $SABOTEUR_EXTRA
+        code=$?
+        set -e
+        if [ -f saboteur-report.json ]; then
+          echo "score=$(node -p "JSON.parse(require('fs').readFileSync('saboteur-report.json','utf8')).score.percent")" >> "$GITHUB_OUTPUT"
+          echo "missed=$(node -p "JSON.parse(require('fs').readFileSync('saboteur-report.json','utf8')).score.missed")" >> "$GITHUB_OUTPUT"
+        fi
+        if [ -f saboteur-report.md ]; then cat saboteur-report.md >> "$GITHUB_STEP_SUMMARY"; fi
+        exit $code
+
+    - name: Upload report
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: rls-saboteur-report
+        path: |
+          ${{ inputs.working-directory }}/saboteur-report.md
+          ${{ inputs.working-directory }}/saboteur-report.json
+        if-no-files-found: ignore

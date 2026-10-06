@@ -1,0 +1,14 @@
+{
+  "name": "rls-saboteur",
+  "owner": { "name": "Matt Muller" },
+  "plugins": [
+    {
+      "name": "rls-saboteur",
+      "source": "./plugin",
+      "description": "Mutation testing for Postgres and Supabase RLS, with a /sabotage command that writes the missing tests.",
+      "author": { "name": "Matt Muller" },
+      "repository": "https://github.com/mattmuller/rls-saboteur",
+      "license": "MIT"
+    }
+  ]
+}
