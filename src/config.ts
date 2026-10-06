@@ -92,3 +92,39 @@ export function withDatabase(dbUrl: string, database: string): string {
   u.pathname = '/' + encodeURIComponent(database);
   return u.toString();
 }
+
+/**
+ * Remove credentials from text that came from outside: test output, child
+ * process errors, driver messages. psql, pg_prove and the Supabase CLI can echo
+ * a connection string, and a copy's URL carries the same password.
+ *
+ * Known URLs are replaced by their redacted form, raw and percent-decoded. Then
+ * any user:password@ in a URL, and any password=... / PGPASSWORD=... token, is masked.
+ */
+export function scrubSecrets(text: string, knownUrls: string[] = []): string {
+  let out = text;
+  for (const url of knownUrls) {
+    if (!url) continue;
+    const safe = redact(url);
+    let decoded = url;
+    try {
+      decoded = decodeURIComponent(url);
+    } catch {
+      /* keep raw */
+    }
+    for (const form of new Set([url, decoded])) out = out.split(form).join(safe);
+    try {
+      const pw = new URL(url).password;
+      if (pw) {
+        for (const form of new Set([pw, decodeURIComponent(pw)])) {
+          if (form.length >= 3) out = out.split(form).join('***');
+        }
+      }
+    } catch {
+      /* not a URL */
+    }
+  }
+  out = out.replace(/(postgres(?:ql)?:\/\/)([^\s:@/]*):([^\s@/]*)@/gi, '$1$2:***@');
+  out = out.replace(/\b(PGPASSWORD|password)\s*=\s*('[^']*'|"[^"]*"|[^\s'"]+)/gi, '$1=***');
+  return out;
+}

@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 import { readFileSync, writeFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
-import { CONFIG_FILE, discoverDbUrl, readFileConfig } from './config.js';
+import { CONFIG_FILE, discoverDbUrl, readFileConfig, scrubSecrets } from './config.js';
 import { REMOTE_FLAG, remoteRefusal } from './safety.js';
 import { consoleReport, exitCode, jsonReport, markdownReport } from './report.js';
 import { run } from './run.js';
 import { discoverSuite } from './tests.js';
 import type { IsolationMode } from './isolation.js';
 
+let knownUrl: string[] = [];
 const HELP = `rls-saboteur: mutation testing for Postgres and Supabase RLS
 
 Breaks each row level security policy on purpose, one at a time, runs your tests,
@@ -80,6 +81,7 @@ async function main(): Promise<number> {
   const cwd = process.cwd();
   const file = readFileConfig(cwd);
   const found = discoverDbUrl(cwd, v['db-url']);
+  knownUrl = [found.dbUrl];
   const refusal = remoteRefusal(found.dbUrl, Boolean(v[REMOTE_FLAG.slice(2)]));
   if (refusal) {
     process.stderr.write(refusal + '\n');
@@ -124,17 +126,18 @@ async function main(): Promise<number> {
     for (const b of result.breaks) out.write(`  ${b.id}\n      ${b.label}\n`);
     return 0;
   }
-  out.write(consoleReport(model, Boolean(process.stdout.isTTY) && !v.json) + '\n');
-  writeFileSync(v.report ?? 'saboteur-report.md', markdownReport(model));
-  if (v.json) process.stdout.write(jsonReport(model) + '\n');
-  if (v['json-file']) writeFileSync(v['json-file'], jsonReport(model));
+  const urls = [found.dbUrl];
+  out.write(scrubSecrets(consoleReport(model, Boolean(process.stdout.isTTY) && !v.json), urls) + '\n');
+  writeFileSync(v.report ?? 'saboteur-report.md', scrubSecrets(markdownReport(model), urls));
+  if (v.json) process.stdout.write(scrubSecrets(jsonReport(model), urls) + '\n');
+  if (v['json-file']) writeFileSync(v['json-file'], scrubSecrets(jsonReport(model), urls));
   return exitCode(model);
 }
 
 main().then(
   (code) => process.exit(code),
   (e: Error) => {
-    process.stderr.write(`rls-saboteur could not check: ${e.message}\n`);
+    process.stderr.write(`rls-saboteur could not check: ${scrubSecrets(e.message, knownUrl)}\n`);
     process.exit(2);
   }
 );

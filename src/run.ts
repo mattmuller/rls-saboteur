@@ -2,7 +2,7 @@ import pg from 'pg';
 import { generateBreaks } from './breaks.js';
 import { readCatalogue } from './catalogue.js';
 import { runChecks } from './checks.js';
-import { type SkipRule, redact } from './config.js';
+import { type SkipRule, redact, scrubSecrets } from './config.js';
 import { createIsolation, type IsolationMode } from './isolation.js';
 import { describeCatalogue, type RunModel } from './report.js';
 import { filesMentioning, type TestSuite } from './tests.js';
@@ -107,7 +107,7 @@ export async function run(o: RunOptions): Promise<RunOutput> {
     if (!base.ok) {
       model.couldNotCheck =
         `the tests fail before any policy is broken${base.timedOut ? ' (timed out)' : ''}. Fix them first.\n` +
-        tail(base.output);
+        tail(base.output, [o.dbUrl]);
       model.durationMs = Date.now() - started;
       return { model, breaks };
     }
@@ -122,7 +122,7 @@ export async function run(o: RunOptions): Promise<RunOutput> {
   });
   try {
     model.isolation = iso.mode;
-    model.notes = iso.notes;
+    model.notes = iso.notes.map((n) => scrubSecrets(n, [o.dbUrl]));
     if (iso.mode === 'template') {
       const copyBase = await iso.withPristine((url) => suite.run(url, { timeoutMs: o.timeoutMs }));
       if (!copyBase.ok) {
@@ -130,7 +130,7 @@ export async function run(o: RunOptions): Promise<RunOutput> {
           'the tests pass on your database but fail on an unchanged copy of it. ' +
           'They probably depend on something a copy does not carry (a connection setting or an outside service). ' +
           'Try --isolation in-place.\n' +
-          tail(copyBase.output);
+          tail(copyBase.output, [o.dbUrl]);
         model.durationMs = Date.now() - started;
         return { model, breaks };
       }
@@ -167,7 +167,7 @@ export async function run(o: RunOptions): Promise<RunOutput> {
               : { brk: b, outcome: t.ok ? 'missed' : 'caught', ms: Date.now() - t0 };
           }
         } catch (e) {
-          r = { brk: b, outcome: 'skipped', note: `the break could not be applied: ${(e as Error).message}`, ms: Date.now() - t0 };
+          r = { brk: b, outcome: 'skipped', note: scrubSecrets(`the break could not be applied: ${(e as Error).message}`, [o.dbUrl]), ms: Date.now() - t0 };
         }
         results.push(r);
         done++;
@@ -186,7 +186,7 @@ export async function run(o: RunOptions): Promise<RunOutput> {
   return { model, breaks };
 }
 
-function tail(s: string): string {
+function tail(s: string, urls: string[]): string {
   const lines = s.trim().split(/\r?\n/);
-  return lines.slice(-15).join('\n');
+  return scrubSecrets(lines.slice(-15).join('\n'), urls);
 }
