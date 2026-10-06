@@ -1,5 +1,8 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { isLocalHost } from './safety.js';
+
+const LOCAL_DEFAULT_PASSWORDS = new Set(['postgres', 'password', 'supabase']);
 
 /** Read `[db] port` from a Supabase config.toml. Only that one key; this is not a TOML parser. */
 export function readDbPort(toml: string): number | null {
@@ -126,14 +129,15 @@ export function scrubSecrets(text: string, knownUrls: string[] = []): string {
       const u = new URL(url);
       const pw = u.password;
       if (pw) {
-        // A bare password shorter than 6 characters would mangle ordinary text, so only
-        // longer ones are replaced on their own. Short ones are still removed above,
-        // because the full-URL replacement runs whatever the length.
-        // Also skip a password that is just the user name or another part of the URL
-        // (a local default of postgres:postgres), or every "postgres" in the text would vanish.
-        const ordinary = new Set([u.username, u.hostname, u.pathname.slice(1)].map(safeDecode));
-        for (const form of new Set([pw, safeDecode(pw)])) {
-          if (form.length >= 6 && !ordinary.has(form)) out = out.split(form).join('***');
+        // A well-known local default (postgres:postgres on localhost) is not a secret, and
+        // replacing the bare word would erase "postgres" from ordinary text. Every other
+        // password is replaced bare, whatever it equals and however short it is. The
+        // full-URL replacement above has already run regardless.
+        const localDefault = LOCAL_DEFAULT_PASSWORDS.has(safeDecode(pw)) && isLocalHost(u.hostname.replace(/^\[|\]$/g, ''));
+        if (!localDefault) {
+          for (const form of new Set([pw, safeDecode(pw)])) {
+            if (form.length >= 3) out = out.split(form).join('***');
+          }
         }
       }
     } catch {

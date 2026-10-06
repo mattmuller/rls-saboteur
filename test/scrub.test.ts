@@ -97,3 +97,23 @@ describe('malformed escapes and nasty inputs', () => {
     }
   });
 });
+
+describe('bare password replacement', () => {
+  it('scrubs a remote password that equals the user name', () => {
+    const url = 'postgres://deploy:deploy@db.example.com:5432/app';
+    expect(scrubSecrets('login failed for deploy / secret deploy', [url])).not.toMatch(/secret deploy/);
+  });
+  it('scrubs a 4-character remote password', () => {
+    const url = 'postgres://u:ab12@db.example.com:5432/app';
+    expect(scrubSecrets('bad credential ab12 rejected', [url])).not.toContain('ab12');
+  });
+  it('leaves the word postgres alone for the local default credential', () => {
+    const url = 'postgres://postgres:postgres@127.0.0.1:54322/postgres';
+    const out = scrubSecrets('postgres says no: user postgres', [url]);
+    expect(out).toContain('postgres says no');
+  });
+  it('scrubs the local default password on a remote host', () => {
+    const url = 'postgres://u:postgres@db.example.com:5432/app';
+    expect(scrubSecrets('password was postgres', [url])).not.toContain('postgres');
+  });
+});
