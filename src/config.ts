@@ -99,6 +99,14 @@ export function withDatabase(dbUrl: string, database: string): string {
   return u.toString();
 }
 
+function safeDecode(s: string): string {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+}
+
 /**
  * Remove credentials from text that came from outside: test output, child
  * process errors, driver messages. psql, pg_prove and the Supabase CLI can echo
@@ -112,12 +120,7 @@ export function scrubSecrets(text: string, knownUrls: string[] = []): string {
   for (const url of knownUrls) {
     if (!url) continue;
     const safe = redact(url);
-    let decoded = url;
-    try {
-      decoded = decodeURIComponent(url);
-    } catch {
-      /* keep raw */
-    }
+    const decoded = safeDecode(url);
     for (const form of new Set([url, decoded])) out = out.split(form).join(safe);
     try {
       const pw = new URL(url).password;
@@ -125,7 +128,7 @@ export function scrubSecrets(text: string, knownUrls: string[] = []): string {
         // A bare password shorter than 3 characters would mangle ordinary text, so only
         // longer ones are replaced on their own. Short ones are still removed above,
         // because the full-URL replacement runs whatever the length.
-        for (const form of new Set([pw, decodeURIComponent(pw)])) {
+        for (const form of new Set([pw, safeDecode(pw)])) {
           if (form.length >= 3) out = out.split(form).join('***');
         }
       }
@@ -136,6 +139,6 @@ export function scrubSecrets(text: string, knownUrls: string[] = []): string {
   // Userinfo runs to the LAST @ before the host, so a password holding / or @ is covered.
   out = out.replace(/(postgres(?:ql)?:\/\/)[^\s]*@(?=[^\s@]+(?:[/?\s]|$))/gi, '$1***@');
   // Query-string and libpq keyword forms.
-  out = out.replace(/\b(PGPASSWORD|(?:ssl)?password|sslkey|sslcert)\s*=\s*('[^']*'|"[^"]*"|[^\s'"&]+)/gi, '$1=***');
+  out = out.replace(/\b(PGPASSWORD|(?:ssl)?password|sslkey|sslcert)\s*=\s*('[^']*'|\\?"[^"]*?\\?"|[^\s'"&]+)/gi, '$1=***');
   return out;
 }
