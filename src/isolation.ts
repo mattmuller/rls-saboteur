@@ -56,8 +56,9 @@ export async function sweepStale(admin: pg.Client): Promise<number> {
   const res = await admin.query(`select datname from pg_database where datname like 'saboteur\\_%'`);
   let dropped = 0;
   for (const { datname } of res.rows as { datname: string }[]) {
-    const m = /^saboteur_(\d+)_/.exec(datname);
-    if (m && pidAlive(Number(m[1]))) continue;
+    // Only databases this tool named: saboteur_<pid>_tpl or saboteur_<pid>_<n>.
+    const m = /^saboteur_(\d+)_(?:tpl|\d+)$/.exec(datname);
+    if (!m || pidAlive(Number(m[1]))) continue;
     try {
       await admin.query(`drop database if exists ${qi(datname)} with (force)`);
       dropped++;
@@ -73,6 +74,11 @@ export interface IsolationOptions {
   mode: IsolationMode;
   /** Allow closing other connections to the source for the first copy. */
   terminate: boolean;
+  /**
+   * A superuser URL, used only to copy and drop databases. A local Supabase stack keeps
+   * connections open as a superuser (the cron scheduler), which the normal role cannot close.
+   */
+  adminUrl?: string;
   /** Runs once on the master template, e.g. installing pgTAP. */
   prepareMaster?: (masterUrl: string) => Promise<void>;
 }
@@ -80,7 +86,8 @@ export interface IsolationOptions {
 export async function createIsolation(o: IsolationOptions): Promise<Isolation> {
   const sourceDb = decodeURIComponent(new URL(o.sourceUrl).pathname.slice(1));
   const adminDb = sourceDb === 'template1' ? 'postgres' : 'template1';
-  const adminUrl = withDatabase(o.sourceUrl, adminDb);
+  const adminUrl = withDatabase(o.adminUrl ?? o.sourceUrl, adminDb);
+  const owner = decodeURIComponent(new URL(o.sourceUrl).username);
   const notes: string[] = [];
 
   if (o.mode === 'in-place') return inPlace(o.sourceUrl, notes, 'in-place mode was requested');
@@ -91,7 +98,7 @@ export async function createIsolation(o: IsolationOptions): Promise<Isolation> {
   try {
     await sweepStale(admin);
     master = `${PREFIX}${process.pid}_tpl`;
-    const created = await makeMaster(admin, sourceDb, master, o.terminate, notes);
+    const created = await makeMaster(admin, sourceDb, master, owner, o.terminate, notes, Boolean(o.adminUrl));
     if (!created.ok) {
       if (o.mode === 'template') {
         throw new Error(
@@ -116,7 +123,7 @@ export async function createIsolation(o: IsolationOptions): Promise<Isolation> {
       const a = await connect(adminUrl);
       live.add(name);
       try {
-        await a.query(`create database ${qi(name)} template ${qi(master)}`);
+        await a.query(`create database ${qi(name)} template ${qi(master)}${owner ? ` owner ${qi(owner)}` : ''}`);
         const url = withDatabase(o.sourceUrl, name);
         if (brk) {
           const c = await connect(url);
@@ -167,10 +174,13 @@ async function makeMaster(
   admin: pg.Client,
   sourceDb: string,
   master: string,
+  owner: string,
   terminate: boolean,
-  notes: string[]
+  notes: string[],
+  haveAdminUrl: boolean
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
-  const create = () => admin.query(`create database ${qi(master)} template ${qi(sourceDb)}`);
+  const create = () =>
+    admin.query(`create database ${qi(master)} template ${qi(sourceDb)}${owner ? ` owner ${qi(owner)}` : ''}`);
   try {
     await create();
     return { ok: true };
@@ -196,8 +206,12 @@ async function makeMaster(
   }
   try {
     for (let attempt = 0; attempt < 8; attempt++) {
+      // Only sessions this role may signal: its own, or any when it is a superuser.
       await admin.query(
-        `select pg_terminate_backend(pid) from pg_stat_activity where datname = $1 and pid <> pg_backend_pid()`,
+        `select pg_terminate_backend(pid) from pg_stat_activity
+          where datname = $1 and pid <> pg_backend_pid()
+            and (usesysid = (select oid from pg_roles where rolname = current_user)
+                 or (select rolsuper from pg_roles where rolname = current_user))`,
         [sourceDb]
       );
       try {
@@ -211,7 +225,12 @@ async function makeMaster(
         await new Promise((r) => setTimeout(r, 150));
       }
     }
-    return { ok: false, reason: `"${sourceDb}" still has connections that this role cannot close` };
+    return {
+      ok: false,
+      reason:
+        `"${sourceDb}" still has connections that this role cannot close` +
+        (haveAdminUrl ? '' : ' (a local Supabase keeps a superuser cron connection open; --admin-url lets it be closed)')
+    };
   } finally {
     if (blocked) await admin.query(`alter database ${qi(sourceDb)} with allow_connections true`).catch(() => {});
   }

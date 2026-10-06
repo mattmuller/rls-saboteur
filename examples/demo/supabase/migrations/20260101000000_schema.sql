@@ -48,6 +48,21 @@ $$;
 grant execute on function public.is_org_admin(uuid) to authenticated;
 revoke execute on function public.is_org_admin(uuid) from public, anon;
 
+-- The orgs the signed-in user belongs to. A policy on members cannot select from
+-- members directly (infinite recursion), so it goes through this function.
+create function public.my_org_ids()
+returns setof uuid
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select m.org_id from public.members m where m.user_id = auth.uid();
+$$;
+
+grant execute on function public.my_org_ids() to authenticated;
+revoke execute on function public.my_org_ids() from public, anon;
+
 alter table public.orgs enable row level security;
 alter table public.members enable row level security;
 alter table public.documents enable row level security;
@@ -58,7 +73,7 @@ grant select, insert, update, delete on public.orgs, public.members, public.docu
 -- orgs
 create policy "members read their orgs" on public.orgs
   for select to authenticated
-  using (id in (select org_id from public.members where user_id = auth.uid()));
+  using (id in (select public.my_org_ids()));
 
 create policy "anyone creates an org they own" on public.orgs
   for insert to authenticated
@@ -67,7 +82,7 @@ create policy "anyone creates an org they own" on public.orgs
 -- members
 create policy "members read co-members" on public.members
   for select to authenticated
-  using (org_id in (select m.org_id from public.members m where m.user_id = auth.uid()));
+  using (org_id in (select public.my_org_ids()));
 
 create policy "admins manage members" on public.members
   for all to authenticated
@@ -77,22 +92,19 @@ create policy "admins manage members" on public.members
 -- documents
 create policy "members read documents" on public.documents
   for select to authenticated
-  using (org_id in (select org_id from public.members where user_id = auth.uid()));
+  using (org_id in (select public.my_org_ids()));
 
 create policy "members write own documents" on public.documents
   for insert to authenticated
   with check (
     author_id = auth.uid()
-    and org_id in (select org_id from public.members where user_id = auth.uid())
+    and org_id in (select public.my_org_ids())
   );
 
 create policy "authors update own documents" on public.documents
   for update to authenticated
   using (author_id = auth.uid())
-  with check (
-    author_id = auth.uid()
-    and org_id in (select org_id from public.members where user_id = auth.uid())
-  );
+  with check (author_id = auth.uid());
 
 create policy "authors delete own documents" on public.documents
   for delete to authenticated

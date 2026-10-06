@@ -20,8 +20,8 @@ select lives_ok(
   $$insert into public.invoices (org_id, issued_by, amount_cents)
     values ('a0000000-0000-0000-0000-00000000000a', '11111111-1111-1111-1111-111111111111', 1200)$$,
   'an admin creates an invoice');
-select lives_ok(
-  $$update public.invoices set paid = true where id = 'e0000000-0000-0000-0000-000000000001'$$,
+update public.invoices set paid = true where id = 'e0000000-0000-0000-0000-000000000001';
+select is((select paid from public.invoices where id = 'e0000000-0000-0000-0000-000000000001'), true,
   'an admin updates an invoice');
 
 -- A plain member sees none.

@@ -123,13 +123,17 @@ export function scrubSecrets(text: string, knownUrls: string[] = []): string {
     const decoded = safeDecode(url);
     for (const form of new Set([url, decoded])) out = out.split(form).join(safe);
     try {
-      const pw = new URL(url).password;
+      const u = new URL(url);
+      const pw = u.password;
       if (pw) {
-        // A bare password shorter than 3 characters would mangle ordinary text, so only
+        // A bare password shorter than 6 characters would mangle ordinary text, so only
         // longer ones are replaced on their own. Short ones are still removed above,
         // because the full-URL replacement runs whatever the length.
+        // Also skip a password that is just the user name or another part of the URL
+        // (a local default of postgres:postgres), or every "postgres" in the text would vanish.
+        const ordinary = new Set([u.username, u.hostname, u.pathname.slice(1)].map(safeDecode));
         for (const form of new Set([pw, safeDecode(pw)])) {
-          if (form.length >= 3) out = out.split(form).join('***');
+          if (form.length >= 6 && !ordinary.has(form)) out = out.split(form).join('***');
         }
       }
     } catch {

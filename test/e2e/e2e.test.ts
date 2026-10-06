@@ -23,6 +23,7 @@ let reachable = false;
 
 beforeAll(async () => {
   const admin = new pg.Client({ connectionString: base });
+  admin.on('error', () => {});
   try {
     await admin.connect();
     reachable = true;
@@ -34,15 +35,15 @@ beforeAll(async () => {
   await admin.query(`do $$ begin if not exists (select 1 from pg_roles where rolname = 'app_user') then create role app_user; end if; end $$`);
   await admin.end();
   const c = new pg.Client({ connectionString: url(dbName) });
+  c.on('error', () => {});
   await c.connect();
   await c.query(`
     create table docs (id int primary key, org text not null, owner uuid not null);
     grant select, insert, update, delete on docs to app_user;
     alter table docs enable row level security;
     create function whoami() returns uuid language sql stable as
-      $$ select nullif(current_setting('request.jwt.claims', true), '')::json ->> 'sub' $$ ;
-  `.replace('returns uuid language sql stable as\n      $$ select nullif(current_setting(\'request.jwt.claims\', true), \'\')::json ->> \'sub\' $$',
-    "returns uuid language sql stable as $$ select (nullif(current_setting('request.jwt.claims', true), '')::json ->> 'sub')::uuid $$"));
+      $$ select (nullif(current_setting('request.jwt.claims', true), '')::json ->> 'sub')::uuid $$;
+  `);
   await c.query(`
     create policy "read own" on docs for select to app_user using (owner = whoami());
     create policy "insert own" on docs for insert to app_user with check (owner = whoami());

@@ -94,7 +94,7 @@ describe('generateBreaks', () => {
   it('swaps the column compared with auth.uid() for another column of the same type', () => {
     const b = generateBreaks(cat([policy({ qual: '(author_id = auth.uid())' })])).breaks.filter((x) => x.kind === 'column-swapped');
     expect(b).toHaveLength(1);
-    expect(b[0].apply[0]).toContain('using (("id" = auth.uid()))');
+    expect(b[0].apply[0]).toContain('using (("org_id" = auth.uid()))');
   });
 
   it('handles the cached ( SELECT auth.uid() AS uid) form', () => {

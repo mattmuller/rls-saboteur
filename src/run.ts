@@ -18,6 +18,7 @@ export interface RunOptions {
   timeoutMs: number;
   isolation: IsolationMode;
   terminate: boolean;
+  adminUrl?: string;
   onlyRelated: boolean;
   checksOnly: boolean;
   dryRun: boolean;
@@ -48,7 +49,8 @@ export async function run(o: RunOptions): Promise<RunOutput> {
     policies: [],
     threshold: o.threshold,
     jobs: o.jobs,
-    durationMs: 0
+    durationMs: 0,
+    checksOnly: o.checksOnly
   };
 
   // Catalogue only. No user table is read.
@@ -118,6 +120,7 @@ export async function run(o: RunOptions): Promise<RunOutput> {
     sourceUrl: o.dbUrl,
     mode: o.isolation,
     terminate: o.terminate,
+    adminUrl: o.adminUrl,
     prepareMaster: suite.prepare ? (url) => suite.prepare!(url) : undefined
   });
   try {

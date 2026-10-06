@@ -23,11 +23,14 @@ Options
   --test "<command>"    Run this command instead of "supabase test db". It must exit non-zero on failure.
                         The database is passed as $DATABASE_URL, $SABOTEUR_DB_URL, the PG* variables,
                         and as {{db_url}} inside the command.
+  --tests-dir <dir>     Directory of pgTAP files. Default: supabase/tests
   --runner <name>       auto (default), supabase, or psql. For the default pgTAP discovery.
   --jobs <n>            Breaks to run in parallel on database copies. Default: 2
   --threshold <pct>     Fail below this score. Default: 100
   --only-related        Per break, run only the test files that mention the table
   --isolation <mode>    auto (default), template, or in-place
+  --admin-url <url>     Superuser URL used only to copy and drop databases. A local Supabase keeps a
+                        superuser cron connection open; with this, copies (and --jobs) work.
   --no-terminate        Do not close other connections to take the first copy. Falls back to in-place.
   --timeout <seconds>   Per test run. Default: 600
   --filter <text>       Only breaks whose id contains this text
@@ -51,11 +54,13 @@ async function main(): Promise<number> {
       schemas: { type: 'string' },
       test: { type: 'string' },
       runner: { type: 'string' },
+      'tests-dir': { type: 'string' },
       jobs: { type: 'string' },
       threshold: { type: 'string' },
       'only-related': { type: 'boolean' },
       isolation: { type: 'string' },
       'no-terminate': { type: 'boolean' },
+      'admin-url': { type: 'string' },
       timeout: { type: 'string' },
       filter: { type: 'string' },
       'checks-only': { type: 'boolean' },
@@ -81,8 +86,10 @@ async function main(): Promise<number> {
   const cwd = process.cwd();
   const file = readFileConfig(cwd);
   const found = discoverDbUrl(cwd, v['db-url']);
-  knownUrl = [found.dbUrl];
-  const refusal = remoteRefusal(found.dbUrl, Boolean(v[REMOTE_FLAG.slice(2)]));
+  knownUrl = [found.dbUrl, ...(v['admin-url'] ? [v['admin-url']] : [])];
+  const refusal =
+    remoteRefusal(found.dbUrl, Boolean(v[REMOTE_FLAG.slice(2)])) ??
+    (v['admin-url'] ? remoteRefusal(v['admin-url'], Boolean(v[REMOTE_FLAG.slice(2)])) : null);
   if (refusal) {
     process.stderr.write(refusal + '\n');
     return 2;
@@ -95,7 +102,7 @@ async function main(): Promise<number> {
   }
   const runner = (v.runner ?? 'auto') as 'auto' | 'supabase' | 'psql';
   const schemas = v.schemas ? v.schemas.split(',').map((s) => s.trim()).filter(Boolean) : (file.schemas?.length ? file.schemas : ['public']);
-  const suite = discoverSuite({ cwd, command: v.test ?? file.test, runner });
+  const suite = discoverSuite({ cwd, command: v.test ?? file.test, runner, testsDir: v['tests-dir'] });
   const tty = Boolean(process.stderr.isTTY);
 
   const out = v.json ? process.stderr : process.stdout;
@@ -109,6 +116,7 @@ async function main(): Promise<number> {
     timeoutMs: (v.timeout ? Number(v.timeout) : 600) * 1000,
     isolation,
     terminate: !v['no-terminate'],
+    adminUrl: v['admin-url'],
     onlyRelated: Boolean(v['only-related']),
     checksOnly: Boolean(v['checks-only']),
     dryRun: Boolean(v['dry-run']),
@@ -126,7 +134,7 @@ async function main(): Promise<number> {
     for (const b of result.breaks) out.write(`  ${b.id}\n      ${b.label}\n`);
     return 0;
   }
-  const urls = [found.dbUrl];
+  const urls = knownUrl;
   out.write(scrubSecrets(consoleReport(model, Boolean(process.stdout.isTTY) && !v.json), urls) + '\n');
   writeFileSync(v.report ?? 'saboteur-report.md', scrubSecrets(markdownReport(model), urls));
   if (v.json) process.stdout.write(scrubSecrets(jsonReport(model), urls) + '\n');

@@ -135,6 +135,8 @@ export interface SuiteOptions {
   /** `--test` command. Takes precedence over discovery. */
   command?: string;
   runner?: 'auto' | 'supabase' | 'psql';
+  /** Directory of pgTAP files. Default supabase/tests. */
+  testsDir?: string;
 }
 
 export function discoverSuite(o: SuiteOptions): TestSuite | null {
@@ -153,19 +155,21 @@ export function discoverSuite(o: SuiteOptions): TestSuite | null {
     };
   }
 
-  const files = findTestFiles(o.cwd);
+  const testsDir = o.testsDir ?? TESTS_DIR;
+  const files = findTestFiles(o.cwd, testsDir);
   if (files.length === 0) return null;
   const contents = new Map(files.map((f) => [f, readFileSync(join(o.cwd, f), 'utf8').toLowerCase()]));
   const useSupabase = o.runner === 'supabase' || (o.runner !== 'psql' && which('supabase'));
 
   if (useSupabase) {
     return {
-      description: `${TESTS_DIR}/*.sql  (pgTAP, run with supabase test db)`,
+      description: `${testsDir}/*.sql  (pgTAP, run with supabase test db)`,
       mode: 'supabase',
       files,
       contents,
       async run(dbUrl, opts) {
-        const args = ['test', 'db', '--db-url', dbUrl, ...(opts.files ?? [])];
+        // A custom directory is passed explicitly; the CLI only looks in supabase/tests by itself.
+        const args = ['test', 'db', '--db-url', dbUrl, ...(opts.files ?? (testsDir === TESTS_DIR ? [] : [testsDir]))];
         const r = await execute('supabase', args, process.env, o.cwd, opts.timeoutMs, false);
         const m = /Tests=(\d+)/.exec(r.output);
         return {
@@ -179,7 +183,7 @@ export function discoverSuite(o: SuiteOptions): TestSuite | null {
   }
 
   return {
-    description: `${TESTS_DIR}/*.sql  (pgTAP, run file by file with psql)`,
+    description: `${testsDir}/*.sql  (pgTAP, run file by file with psql)`,
     mode: 'psql',
     files,
     contents,

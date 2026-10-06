@@ -288,7 +288,7 @@ export function generateBreaks(cat: Catalogue): GenerateResult {
             id: idOf('conjunct-removed', `#${clause === 'using' ? 'u' : 'c'}${i + 1}`),
             kind: 'conjunct-removed',
             label: `${clauseName} condition removed: ${oneLine(removed)}`,
-            effect: `the condition ${oneLine(removed)} is no longer enforced`,
+            effect: `rows that fail this condition now pass the policy`,
             apply: [alterSql(p, clause, rest)],
             restore: [alterSql(p, clause, original)]
           });
@@ -302,7 +302,9 @@ export function generateBreaks(cat: Catalogue): GenerateResult {
           const cols = colInfo(cmp.scope.schema, cmp.scope.table);
           const current = cols.find((c) => c.column === cmp.column);
           if (!current) continue;
-          const alt = cols.find((c) => c.column !== cmp.column && c.type === current.type);
+          const sameType = cols.filter((c) => c.column !== cmp.column && c.type === current.type);
+          // A foreign-key style column is the likelier real mistake than the primary key.
+          const alt = sameType.find((c) => c.column !== 'id') ?? sameType[0];
           if (!alt) continue;
           const prefix = expr.slice(cmp.start, cmp.end - cmp.column.length);
           const swapped = expr.slice(0, cmp.start) + prefix + qi(alt.column) + expr.slice(cmp.end);

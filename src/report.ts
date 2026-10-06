@@ -21,6 +21,8 @@ export interface RunModel {
   durationMs: number;
   /** Set when the run could not check (exit 2). */
   couldNotCheck?: string;
+  /** Only the checks that need no tests were run. */
+  checksOnly?: boolean;
 }
 
 export interface Score {
@@ -99,7 +101,9 @@ export function consoleReport(m: RunModel, color: boolean): string {
   row('Database', `${m.database}  (${m.databaseSource})`);
   row('Tests', m.testsDescription);
   row('Policies', `${m.policyCount} on ${m.tableCount} tables in ${m.schemas.join(', ')}`);
-  if (m.couldNotCheck) {
+  if (m.checksOnly) {
+    // no tests were run
+  } else if (m.couldNotCheck) {
     out.push('');
     out.push(red(`Could not check: ${m.couldNotCheck}`));
   } else {
@@ -111,9 +115,9 @@ export function consoleReport(m: RunModel, color: boolean): string {
     );
     for (const n of m.notes) out.push(dim(`  note: ${n}`));
     const w = String(s.caught + s.missed).length;
-    out.push(`  ${green('caught')}  ${pad(String(s.caught), w)} / ${s.caught + s.missed}`);
+    out.push(`  ${green('caught')}  ${String(s.caught).padStart(w)} / ${s.caught + s.missed}`);
     out.push(
-      `  ${red('MISSED')}  ${pad(String(s.missed), w)} / ${s.caught + s.missed}  your tests still pass with these policies broken`
+      `  ${red('MISSED')}  ${String(s.missed).padStart(w)} / ${s.caught + s.missed}  your tests still pass with these policies broken`
     );
     const missed = m.results.filter((r) => r.outcome === 'missed');
     for (const r of missed.slice(0, INLINE_MISSED)) {
@@ -144,7 +148,7 @@ export function consoleReport(m: RunModel, color: boolean): string {
 
   const code = exitCode(m);
   const pct = s.percent === null ? 'n/a' : `${s.percent}%`;
-  out.push(`Score  ${pct}   exit ${code} (threshold ${m.threshold}%)`);
+  out.push(m.checksOnly ? `Checks only   exit ${code}` : `Score  ${pct}   exit ${code} (threshold ${m.threshold}%)`);
   return out.join('\n');
 }
 
