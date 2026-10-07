@@ -110,6 +110,36 @@ describe('generateBreaks', () => {
     expect(b[0].apply[0]).toContain('members."org_id" = auth.uid()');
   });
 
+  it('swaps a quoted column name, as pg_get_expr prints mixed-case and spaced names', () => {
+    const c = cat([policy({ table: 'Docs', qual: '("Owner Id" = auth.uid())' })], {
+      tables: [{ schema: 'public', table: 'Docs', rlsEnabled: true, rlsForced: false }],
+      columns: cols('Docs', [
+        ['Owner Id', 'uuid'],
+        ['Backup Owner', 'uuid'],
+        ['Title', 'text']
+      ])
+    });
+    const b = generateBreaks(c).breaks.filter((x) => x.kind === 'column-swapped');
+    expect(b).toHaveLength(1);
+    expect(b[0].apply[0]).toContain('using (("Backup Owner" = auth.uid()))');
+    expect(b[0].label).toContain('Backup Owner');
+  });
+
+  it('swaps a quoted column that carries a table qualifier', () => {
+    const c = cat([policy({ qual: '(org_id IN ( SELECT m.org_id FROM members m WHERE (m."User Id" = auth.uid())))' })], {
+      columns: [
+        ...cols('documents', [['org_id', 'uuid']]),
+        ...cols('members', [
+          ['org_id', 'uuid'],
+          ['User Id', 'uuid']
+        ])
+      ]
+    });
+    const b = generateBreaks(c).breaks.filter((x) => x.kind === 'column-swapped');
+    expect(b).toHaveLength(1);
+    expect(b[0].apply[0]).toContain('m."org_id" = auth.uid()');
+  });
+
   it('skips the swap when no other column has the same type', () => {
     const c = cat([policy({ qual: '(title = auth.uid())' })]);
     expect(kinds(c)).not.toContain('column-swapped');
