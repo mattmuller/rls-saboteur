@@ -1,0 +1,31 @@
+{
+  "args": [
+    "--threshold",
+    "70",
+    "--test",
+    "psql -X -q -v ON_ERROR_STOP=1 -f tests/rls.sql"
+  ],
+  "exit": 0,
+  "caught": [
+    "public.ledger/ledger visible/drop-policy",
+    "public.records/hide locked records/drop-policy",
+    "public.records/hide locked records/using-true",
+    "public.records/hide locked records/restrictive-to-permissive",
+    "public.records/org members read/drop-policy",
+    "public.records/org members read/using-true",
+    "public.records/readers never see secrets/drop-policy",
+    "public.records/readers never see secrets/using-true",
+    "public.records/readers never see secrets/restrictive-to-permissive",
+    "public.records/writers manage org/drop-policy",
+    "public.records/writers manage org/using-true",
+    "public.records/writers manage org/check-removed",
+    "public.records/-/rls-disabled"
+  ],
+  "missed": [
+    "public.ledger/ledger own rows only/drop-policy",
+    "public.ledger/ledger own rows only/using-true",
+    "public.ledger/ledger own rows only/restrictive-to-permissive",
+    "public.ledger/-/rls-disabled"
+  ],
+  "notes": "RESTRICTIVE and PERMISSIVE policies mixed on one table, FOR ALL, several roles per policy, TO PUBLIC. Driven with --test and a plain SQL script (no pgTAP), and --threshold 70 so exit is 0 with misses. Deliberate misses: the ledger restrictive policy and RLS on ledger are never tested."
+}

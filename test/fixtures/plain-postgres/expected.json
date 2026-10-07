@@ -1,0 +1,35 @@
+{
+  "dbRole": {
+    "name": "app_owner",
+    "password": "owner"
+  },
+  "args": [
+    "--tests-dir",
+    "tests"
+  ],
+  "exit": 1,
+  "caught": [
+    "public.docs/tenant inserts docs/drop-policy",
+    "public.docs/tenant inserts docs/check-removed",
+    "public.docs/tenant reads docs/drop-policy",
+    "public.docs/tenant reads docs/using-true",
+    "public.docs/tenant updates live docs/drop-policy",
+    "public.docs/tenant updates live docs/using-true",
+    "public.docs/tenant updates live docs/conjunct-removed#u2",
+    "public.plain_notes/tenant reads notes/drop-policy",
+    "public.plain_notes/tenant reads notes/using-true",
+    "public.docs/-/rls-disabled",
+    "public.plain_notes/-/rls-disabled"
+  ],
+  "missed": [
+    "public.audit_log/tenant reads audit log/drop-policy",
+    "public.audit_log/tenant reads audit log/using-true",
+    "public.docs/admin full access/drop-policy",
+    "public.docs/tenant updates live docs/check-removed",
+    "public.docs/tenant updates live docs/conjunct-removed#u1",
+    "public.plain_notes/tenant deletes notes/drop-policy",
+    "public.plain_notes/tenant deletes notes/using-true",
+    "public.audit_log/-/rls-disabled"
+  ],
+  "notes": "No Supabase: no auth schema, no anon or authenticated roles, tenancy through current_setting. Run with --db-url as a non-superuser owner, --runner psql and --admin-url as the superuser. Deliberate misses: audit_log is untested, the admin policy and the notes DELETE policy are never exercised, and the update WITH CHECK and the tenant condition in UPDATE USING are not probed (SELECT policy hides the rows anyway)."
+}

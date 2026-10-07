@@ -1,0 +1,29 @@
+{
+  "args": [
+    "--tests-dir",
+    "tests",
+    "--schemas",
+    "public,Odd Schema"
+  ],
+  "exit": 1,
+  "caught": [
+    "Odd Schema.Line Items/tenant sees line items/drop-policy",
+    "Odd Schema.Line Items/tenant sees line items/using-true",
+    "public.Mixed Case Docs/insert/own docs in org/check-removed",
+    "public.Mixed Case Docs/insert/own docs in org/conjunct-removed#c1",
+    "public.Mixed Case Docs/owner's \"quoted\" policy/drop-policy",
+    "public.Mixed Case Docs/owner's \"quoted\" policy/using-true",
+    "public.Mixed Case Docs/owner's \"quoted\" policy/column-swapped#u@1",
+    "Odd Schema.Line Items/-/rls-disabled",
+    "public.Mixed Case Docs/-/rls-disabled"
+  ],
+  "missed": [
+    "Odd Schema.Line Items/tenant edits line items/drop-policy",
+    "Odd Schema.Line Items/tenant edits line items/using-true",
+    "Odd Schema.Line Items/tenant edits line items/check-removed",
+    "public.Mixed Case Docs/insert/own docs in org/drop-policy",
+    "public.Mixed Case Docs/insert/own docs in org/conjunct-removed#c2",
+    "public.Mixed Case Docs/insert/own docs in org/column-swapped#c@2"
+  ],
+  "notes": "Quoted mixed-case and spaced table and column names, a policy name with quotes and one with a slash, and a table in the non-public schema 'Odd Schema' covered through --schemas. Includes an auth.uid() comparison on the quoted column \"Owner Id\" (this fixture found the quoted-column column-swapped bug). Deliberate misses: line item UPDATE policy untested; the insert policy has no positive test."
+}

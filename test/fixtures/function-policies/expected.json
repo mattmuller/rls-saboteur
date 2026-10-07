@@ -1,0 +1,27 @@
+{
+  "args": [
+    "--tests-dir",
+    "tests"
+  ],
+  "exit": 1,
+  "caught": [
+    "public.projects/members read projects/drop-policy",
+    "public.projects/members read projects/using-true",
+    "public.projects/-/rls-disabled"
+  ],
+  "missed": [
+    "public.archived_projects/archive readers/drop-policy",
+    "public.archived_projects/archive readers/using-true",
+    "public.projects/members insert projects/drop-policy",
+    "public.projects/members insert projects/check-removed",
+    "public.settings/admins read settings/drop-policy",
+    "public.settings/admins read settings/using-true",
+    "public.archived_projects/-/rls-disabled",
+    "public.settings/-/rls-disabled"
+  ],
+  "findings": [
+    "function-execute:FAIL",
+    "definer-current-user:FAIL"
+  ],
+  "notes": "Policies call SECURITY DEFINER helpers. archived_projects calls a function authenticated cannot EXECUTE: reported by the catalogue check only, never called. settings calls a SECURITY DEFINER function that tests current_user. Both tables are untouched by tests, so their breaks are the deliberate misses; so is the projects INSERT policy."
+}

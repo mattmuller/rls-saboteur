@@ -1,0 +1,23 @@
+{
+  "args": [
+    "--tests-dir",
+    "tests"
+  ],
+  "exit": 1,
+  "caught": [
+    "public.events/tenant reads events/drop-policy",
+    "public.events/tenant reads events/using-true",
+    "public.events/tenant writes events/drop-policy",
+    "public.events/tenant writes events/check-removed",
+    "public.events_billing/tenant reads billing/drop-policy",
+    "public.events_billing/tenant reads billing/using-true",
+    "public.events/-/rls-disabled",
+    "public.events_billing/-/rls-disabled"
+  ],
+  "missed": [
+    "public.events_other/tenant reads other/drop-policy",
+    "public.events_other/tenant reads other/using-true",
+    "public.events_other/-/rls-disabled"
+  ],
+  "notes": "RLS on a partitioned table and on some of its partitions: parent policies apply to parent queries, partition policies to direct partition queries. Policies and RLS flag are broken on both. Deliberate miss: events_other (the default partition) is never queried directly."
+}

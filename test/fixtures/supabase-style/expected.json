@@ -1,0 +1,32 @@
+{
+  "args": [
+    "--tests-dir",
+    "tests"
+  ],
+  "exit": 1,
+  "caught": [
+    "public.profiles/profiles are public/drop-policy",
+    "public.profiles/users update own profile/drop-policy",
+    "public.profiles/users update own profile/using-true",
+    "public.todos/owners and sharees read todos/drop-policy",
+    "public.todos/owners and sharees read todos/using-true",
+    "public.todos/owners and sharees read todos/column-swapped#u@2",
+    "public.todos/owners insert todos/drop-policy",
+    "public.todos/owners insert todos/check-removed",
+    "public.todos/owners insert todos/column-swapped#c@1",
+    "public.profiles/-/rls-disabled",
+    "public.todos/-/rls-disabled"
+  ],
+  "missed": [
+    "public.profiles/users update own profile/check-removed",
+    "public.profiles/users update own profile/column-swapped#u@1",
+    "public.profiles/users update own profile/column-swapped#c@1",
+    "public.shares/participants read shares/drop-policy",
+    "public.shares/participants read shares/using-true",
+    "public.todos/owners delete todos/drop-policy",
+    "public.todos/owners delete todos/using-true",
+    "public.todos/owners delete todos/column-swapped#u@1",
+    "public.shares/-/rls-disabled"
+  ],
+  "notes": "Supabase-shaped: stub auth.uid(), anon/authenticated roles. Deliberate misses: shares is untested, the profile update WITH CHECK and its auth.uid() column swaps are not probed, and todos DELETE is never exercised."
+}
