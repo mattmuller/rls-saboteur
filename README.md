@@ -107,7 +107,7 @@ Score  100%   exit 0 (threshold 100%)
 ### How tests are pointed at a copy
 
 - Default runner: `supabase test db --db-url <copy url>`. The Supabase CLI takes a connection string, so it runs the same pgTAP suite against the copy.
-- No Supabase CLI: `--runner psql` runs each `.sql` file with psql against the copy. It installs pgTAP in the copy. A file fails on a `not ok` line, a `# Looks like you failed` line, or a plan mismatch. A non-zero exit with none of those is an error.
+- No Supabase CLI: `--runner psql` runs each `.sql` file with psql against the copy. It installs pgTAP in the copy. A file fails on a `not ok` line, a `# Looks like you failed` line, or a plan mismatch. Exit 3 (a SQL statement failed under `ON_ERROR_STOP`) also counts as a failure, because the unbroken baseline ran the same files and passed. Any other non-zero exit (1 fatal, 2 connection lost) or a signal is an error. The Supabase runner needs TAP evidence for a failure.
 - Any other command: `--test "pnpm test:rls"`. The copy is passed as `$DATABASE_URL`, `$SABOTEUR_DB_URL`, the `PG*` variables, and as `{{db_url}}` inside the command string. The command must follow the exit code contract below.
 
 **Exit code contract for `--test`.** Exit `0` means every test passed. Exit `1` means a test failed. Any other exit code, or a kill by a signal, means the tests could not run. This is the pytest convention. A break counts as caught only on exit `1`. Your command must exit `1`, and only `1`, when an assertion fails. If it exits `2` for "could not parse a result", the break is an error.

@@ -162,11 +162,17 @@ export function classifyCustom(r: Pick<ExecResult, 'code' | 'signal' | 'timedOut
 }
 
 /** pgTAP runners: a failure needs TAP evidence. A non-zero exit without it means the tests did not run properly. */
-export function classifyTap(r: Pick<ExecResult, 'code' | 'signal' | 'timedOut' | 'output'>): { status: TestStatus; reason?: string } {
+export function classifyTap(
+  r: Pick<ExecResult, 'code' | 'signal' | 'timedOut' | 'output'>,
+  opts: { psql?: boolean } = {}
+): { status: TestStatus; reason?: string } {
   if (r.timedOut) return { status: 'error', reason: 'the tests timed out' };
   if (tapFailed(r.output)) return { status: 'failed' };
   if (r.signal) return { status: 'error', reason: `the test process was killed by ${r.signal}` };
   if (r.code === 0) return { status: 'passed' };
+  // psql exit 3: a statement failed under ON_ERROR_STOP. The unbroken baseline ran the same files and
+  // passed, so the break changed what the SQL does. Exit 1 (fatal) and 2 (connection) stay errors.
+  if (opts.psql && r.code === 3) return { status: 'failed', reason: 'a SQL error stopped the tests' };
   return { status: 'error', reason: `exit code ${r.code} with no failed test in the output` };
 }
 
@@ -248,7 +254,7 @@ export function discoverSuite(o: SuiteOptions): TestSuite | null {
           false
         );
         all += r.output;
-        const c = classifyTap(r);
+        const c = classifyTap(r, { psql: true });
         if (c.status !== 'passed') {
           return { ...c, output: all, assertions: countAssertions(all), timedOut: r.timedOut };
         }

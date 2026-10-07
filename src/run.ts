@@ -196,7 +196,7 @@ export async function run(o: RunOptions): Promise<RunOutput> {
 /** Maps a test run on a broken database to a result. Only a real test failure counts as caught. */
 export function outcomeOf(t: TestRun, urls: string[]): Pick<BreakResult, 'outcome' | 'note'> {
   if (t.status === 'passed') return { outcome: 'missed' };
-  if (t.status === 'failed') return { outcome: 'caught' };
+  if (t.status === 'failed') return t.reason ? { outcome: 'caught', note: scrubSecrets(t.reason, urls) } : { outcome: 'caught' };
   return { outcome: 'error', note: scrubSecrets(t.reason ?? 'the tests could not run', urls) };
 }
 

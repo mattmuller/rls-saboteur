@@ -67,6 +67,18 @@ describe('psql runner', () => {
     expect(r.status).toBe('failed');
     expect(outcomeOf(r, [URL]).outcome).toBe('caught');
   });
+  it('exit 3 with no TAP evidence is caught, with a note', async () => {
+    fakePsql('echo "ERROR: permission denied" >&2; exit 3');
+    const r = await run();
+    expect(r.status).toBe('failed');
+    const o = outcomeOf(r, [URL]);
+    expect(o.outcome).toBe('caught');
+    expect(o.note).toBe('a SQL error stopped the tests');
+  });
+  it('exit 1 (psql fatal) is an error', async () => {
+    fakePsql('echo "psql: error: file not found" >&2; exit 1');
+    expect((await run()).status).toBe('error');
+  });
   it('exit 0 with not ok is caught', async () => {
     fakePsql('echo "not ok 1 - b"');
     expect((await run()).status).toBe('failed');
