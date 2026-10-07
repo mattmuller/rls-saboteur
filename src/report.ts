@@ -134,6 +134,9 @@ export function consoleReport(m: RunModel, color: boolean): string {
     if (s.skipped || s.errored) {
       out.push(dim(`  not counted: ${s.skipped} skipped, ${s.errored} errored (see saboteur-report.md)`));
     }
+    if (s.errored) {
+      out.push(red(`  WARNING: ${s.errored} break(s) errored, so the tests did not run properly. The score leaves them out and may be too high.`));
+    }
     if (m.unparsed.length) {
       out.push(dim(`  ${m.unparsed.length} policy expression(s) could not be parsed; their condition-level breaks were not tried.`));
     }
@@ -161,6 +164,7 @@ export function markdownReport(m: RunModel): string {
   lines.push(`- Policies: ${m.policyCount} on ${m.tableCount} tables in ${m.schemas.join(', ')}`);
   lines.push(`- Isolation: ${m.isolation === 'template' ? 'database copies (CREATE DATABASE ... TEMPLATE)' : 'in place'}`);
   lines.push(`- Score: **${s.percent === null ? 'n/a' : s.percent + '%'}** (${s.caught} caught, ${s.missed} missed, ${s.skipped} skipped, ${s.errored} errored). Threshold ${m.threshold}%.`);
+  if (s.errored) lines.push(`- **Warning:** ${s.errored} break(s) errored, so the tests did not run properly. The score leaves them out and may be too high.`);
   lines.push(`- Run time: ${(m.durationMs / 1000).toFixed(1)} s`, '');
   if (m.couldNotCheck) lines.push(`**Could not check:** ${m.couldNotCheck}`, '');
 

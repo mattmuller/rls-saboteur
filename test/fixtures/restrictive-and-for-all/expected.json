@@ -3,7 +3,7 @@
     "--threshold",
     "70",
     "--test",
-    "psql -X -q -v ON_ERROR_STOP=1 -f tests/rls.sql"
+    "psql -X -q -v ON_ERROR_STOP=1 -f tests/rls.sql; c=$?; [ $c -eq 3 ] && exit 1; exit $c"
   ],
   "exit": 0,
   "caught": [

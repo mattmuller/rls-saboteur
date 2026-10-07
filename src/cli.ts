@@ -22,7 +22,9 @@ Usage
 Options
   --db-url <url>        Database to read. Default: local Supabase, port from supabase/config.toml
   --schemas <a,b>       Schemas to cover. Default: public
-  --test "<command>"    Run this command instead of "supabase test db". It must exit non-zero on failure.
+  --test "<command>"    Run this command instead of "supabase test db". Exit 0 means passed, exit 1 means a
+                        test failed, any other exit code or a signal means the tests could not run (an error,
+                        not a catch).
                         The database is passed as $DATABASE_URL, $SABOTEUR_DB_URL, the PG* variables,
                         and as {{db_url}} inside the command.
   --tests-dir <dir>     Directory of pgTAP files. Default: supabase/tests

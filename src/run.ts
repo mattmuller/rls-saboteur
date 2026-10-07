@@ -5,7 +5,7 @@ import { runChecks } from './checks.js';
 import { type SkipRule, redact, scrubSecrets } from './config.js';
 import { createIsolation, type IsolationMode } from './isolation.js';
 import { describeCatalogue, type RunModel } from './report.js';
-import { filesMentioning, type TestSuite } from './tests.js';
+import { filesMentioning, type TestRun, type TestSuite } from './tests.js';
 import type { Break, BreakResult, Finding } from './types.js';
 
 export interface RunOptions {
@@ -104,10 +104,8 @@ export async function run(o: RunOptions): Promise<RunOutput> {
   if (suite.mode !== 'psql') {
     o.progress('Running the tests once, unchanged...');
     const base = await suite.run(o.dbUrl, { timeoutMs: o.timeoutMs });
-    if (!base.ok) {
-      model.couldNotCheck =
-        `the tests fail before any policy is broken${base.timedOut ? ' (timed out)' : ''}. Fix them first.\n` +
-        tail(base.output, [o.dbUrl]);
+    if (base.status !== 'passed') {
+      model.couldNotCheck = `${baselineMessage(base, [o.dbUrl])}\n${tail(base.output, [o.dbUrl])}`;
       model.durationMs = Date.now() - started;
       return { model, breaks };
     }
@@ -131,12 +129,12 @@ export async function run(o: RunOptions): Promise<RunOutput> {
     if (iso.mode === 'template' || suite.mode === 'psql') {
       const copyBase = await iso.withPristine((url) => suite.run(url, { timeoutMs: o.timeoutMs }));
       model.baselineAssertions ??= copyBase.assertions;
-      if (!copyBase.ok && suite.mode === 'psql') {
-        model.couldNotCheck = `the tests fail before any policy is broken. Fix them first.\n` + tail(copyBase.output, [o.dbUrl]);
+      if (copyBase.status !== 'passed' && suite.mode === 'psql') {
+        model.couldNotCheck = `${baselineMessage(copyBase, [o.dbUrl])}\n${tail(copyBase.output, [o.dbUrl])}`;
         model.durationMs = Date.now() - started;
         return { model, breaks };
       }
-      if (!copyBase.ok) {
+      if (copyBase.status !== 'passed') {
         model.couldNotCheck =
           'the tests pass on your database but fail on an unchanged copy of it. ' +
           'They probably depend on something a copy does not carry (a connection setting or an outside service). ' +
@@ -173,9 +171,7 @@ export async function run(o: RunOptions): Promise<RunOutput> {
             r = { brk: b, outcome: 'missed', note: 'no test file mentions this table', ms: Date.now() - t0 };
           } else {
             const t = await iso.withBreak(b, (url) => suite.run(url, { files, timeoutMs: o.timeoutMs }));
-            r = t.timedOut
-              ? { brk: b, outcome: 'error', note: 'the tests timed out', ms: Date.now() - t0 }
-              : { brk: b, outcome: t.ok ? 'missed' : 'caught', ms: Date.now() - t0 };
+            r = { brk: b, ...outcomeOf(t, [o.dbUrl]), ms: Date.now() - t0 };
           }
         } catch (e) {
           r = { brk: b, outcome: 'skipped', note: scrubSecrets(`the break could not be applied: ${(e as Error).message}`, [o.dbUrl]), ms: Date.now() - t0 };
@@ -195,6 +191,21 @@ export async function run(o: RunOptions): Promise<RunOutput> {
   model.results = results;
   model.durationMs = Date.now() - started;
   return { model, breaks };
+}
+
+/** Maps a test run on a broken database to a result. Only a real test failure counts as caught. */
+export function outcomeOf(t: TestRun, urls: string[]): Pick<BreakResult, 'outcome' | 'note'> {
+  if (t.status === 'passed') return { outcome: 'missed' };
+  if (t.status === 'failed') return { outcome: 'caught' };
+  return { outcome: 'error', note: scrubSecrets(t.reason ?? 'the tests could not run', urls) };
+}
+
+/** Message for a baseline (unbroken) run that did not pass. The run then stops with exit 2. */
+export function baselineMessage(base: TestRun, urls: string[]): string {
+  if (base.status === 'error') {
+    return `the tests could not run before any policy is broken (${scrubSecrets(base.reason ?? 'unknown error', urls)}). Fix that first.`;
+  }
+  return 'the tests fail before any policy is broken. Fix them first.';
 }
 
 function tail(s: string, urls: string[]): string {

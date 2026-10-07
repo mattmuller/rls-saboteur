@@ -1,4 +1,4 @@
--- Plain SQL, no pgTAP. Any failed expectation raises, psql stops, the exit code is non-zero.
+-- Plain SQL, no pgTAP. Any failed expectation raises, psql stops with exit 3. The --test command maps 3 to 1 (a test failed), because the contract treats other codes as errors.
 begin;
 
 create function pg_temp.expect(label text, got int, want int) returns void language plpgsql as

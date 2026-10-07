@@ -2,8 +2,13 @@ import { spawn, spawnSync } from 'node:child_process';
 import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs';
 import { join, relative } from 'node:path';
 
+/** passed: every test passed. failed: the tests ran and at least one assertion failed. error: the tests could not run. */
+export type TestStatus = 'passed' | 'failed' | 'error';
+
 export interface TestRun {
-  ok: boolean;
+  status: TestStatus;
+  /** Short reason, set when status is error. Not yet scrubbed. */
+  reason?: string;
   output: string;
   /** Number of TAP assertions seen, when the runner can tell. */
   assertions?: number;
@@ -67,6 +72,13 @@ export function which(cmd: string): boolean {
   return r.status === 0;
 }
 
+interface ExecResult {
+  code: number | null;
+  signal?: NodeJS.Signals | null;
+  output: string;
+  timedOut: boolean;
+}
+
 function execute(
   command: string,
   args: string[],
@@ -74,7 +86,7 @@ function execute(
   cwd: string,
   timeoutMs: number,
   shell: boolean
-): Promise<{ code: number | null; output: string; timedOut: boolean }> {
+): Promise<ExecResult> {
   return new Promise((resolve) => {
     const child = spawn(command, args, { cwd, env, shell, stdio: ['ignore', 'pipe', 'pipe'] });
     let output = '';
@@ -91,11 +103,11 @@ function execute(
     }, timeoutMs);
     child.on('error', (e) => {
       clearTimeout(timer);
-      resolve({ code: 127, output: output + String(e), timedOut });
+      resolve({ code: 127, signal: null, output: output + String(e), timedOut });
     });
-    child.on('close', (code) => {
+    child.on('close', (code, signal) => {
       clearTimeout(timer);
-      resolve({ code, output, timedOut });
+      resolve({ code, signal, output, timedOut });
     });
   });
 }
@@ -124,10 +136,38 @@ export function countAssertions(output: string): number {
   return n;
 }
 
-function tapFailed(output: string): boolean {
+export function tapFailed(output: string): boolean {
   return output
     .split(/\r?\n/)
-    .some((l) => l.startsWith('not ok') || l.startsWith('# Looks like you') || l.includes('Bad plan'));
+    .some(
+      (l) =>
+        l.startsWith('not ok') ||
+        l.startsWith('# Looks like you') ||
+        l.includes('Bad plan') ||
+        l.includes('Failed test') ||
+        /^Result: FAIL\b/.test(l.trim())
+    );
+}
+
+/**
+ * Custom `--test` command contract: exit 0 passed, exit 1 failed, any other exit code or a signal is an
+ * error (the command could not run). A timeout is an error.
+ */
+export function classifyCustom(r: Pick<ExecResult, 'code' | 'signal' | 'timedOut'>): { status: TestStatus; reason?: string } {
+  if (r.timedOut) return { status: 'error', reason: 'the command timed out' };
+  if (r.signal) return { status: 'error', reason: `the command was killed by ${r.signal}` };
+  if (r.code === 0) return { status: 'passed' };
+  if (r.code === 1) return { status: 'failed' };
+  return { status: 'error', reason: `the command exited with code ${r.code}, which is not 0 or 1` };
+}
+
+/** pgTAP runners: a failure needs TAP evidence. A non-zero exit without it means the tests did not run properly. */
+export function classifyTap(r: Pick<ExecResult, 'code' | 'signal' | 'timedOut' | 'output'>): { status: TestStatus; reason?: string } {
+  if (r.timedOut) return { status: 'error', reason: 'the tests timed out' };
+  if (tapFailed(r.output)) return { status: 'failed' };
+  if (r.signal) return { status: 'error', reason: `the test process was killed by ${r.signal}` };
+  if (r.code === 0) return { status: 'passed' };
+  return { status: 'error', reason: `exit code ${r.code} with no failed test in the output` };
 }
 
 export interface SuiteOptions {
@@ -143,14 +183,14 @@ export function discoverSuite(o: SuiteOptions): TestSuite | null {
   if (o.command) {
     const cmd = o.command;
     return {
-      description: `${cmd}  (your command; must exit non-zero on failure)`,
+      description: `${cmd}  (your command; exit 0 passed, 1 test failed, other: could not run)`,
       mode: 'custom',
       files: [],
       contents: new Map(),
       async run(dbUrl, opts) {
         const withUrl = cmd.split('{{db_url}}').join(JSON.stringify(dbUrl));
         const r = await execute(withUrl, [], dbEnv(dbUrl), o.cwd, opts.timeoutMs, true);
-        return { ok: r.code === 0 && !r.timedOut, output: r.output, timedOut: r.timedOut };
+        return { ...classifyCustom(r), output: r.output, timedOut: r.timedOut };
       }
     };
   }
@@ -173,7 +213,7 @@ export function discoverSuite(o: SuiteOptions): TestSuite | null {
         const r = await execute('supabase', args, process.env, o.cwd, opts.timeoutMs, false);
         const m = /Tests=(\d+)/.exec(r.output);
         return {
-          ok: r.code === 0 && !r.timedOut,
+          ...classifyTap(r),
           output: r.output,
           assertions: m ? Number(m[1]) : undefined,
           timedOut: r.timedOut
@@ -208,11 +248,12 @@ export function discoverSuite(o: SuiteOptions): TestSuite | null {
           false
         );
         all += r.output;
-        if (r.code !== 0 || r.timedOut || tapFailed(r.output)) {
-          return { ok: false, output: all, assertions: countAssertions(all), timedOut: r.timedOut };
+        const c = classifyTap(r);
+        if (c.status !== 'passed') {
+          return { ...c, output: all, assertions: countAssertions(all), timedOut: r.timedOut };
         }
       }
-      return { ok: true, output: all, assertions: countAssertions(all) };
+      return { status: 'passed', output: all, assertions: countAssertions(all) };
     }
   };
 }

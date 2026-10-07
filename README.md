@@ -15,6 +15,8 @@ npx rls-saboteur
 
 No configuration. It reads the database port from `supabase/config.toml`, every policy from the Postgres catalogue, and your pgTAP files from `supabase/tests`.
 
+Against a local Supabase stack, you may need `--admin-url postgres://supabase_admin:postgres@127.0.0.1:<port>/postgres`. Without it, the copy step can fail with "postgres still has connections that this role cannot close". Use the database port from `supabase status`.
+
 ## Before and after
 
 The `examples/demo` project is a small multi-tenant app (orgs, members, documents, invoices) with a pgTAP suite that looks complete and passes.
@@ -98,15 +100,17 @@ Score  100%   exit 0 (threshold 100%)
 ## How it works
 
 1. **Discover.** The database URL comes from `supabase/config.toml` (default port 54322) or `--db-url`. Policies come from `pg_policy`. Tests are the `.sql` files in `supabase/tests`.
-2. **Baseline.** It runs the tests unchanged. If they fail, it stops and says so.
+2. **Baseline.** It runs the tests unchanged. If they fail or cannot run, it stops with exit 2 and says so.
 3. **Copy.** It copies the database once into a master template. Then, for each break, it makes a throwaway database with `CREATE DATABASE ... TEMPLATE`, applies the break with DDL, runs the tests against that copy, and drops it. Your database is not changed.
-4. **Report.** Caught means the tests failed. Missed means they passed.
+4. **Report.** Caught means a test failed. Missed means the tests passed. Error means the tests could not run, for example a crashed psql or a refused connection. An error is never a catch.
 
 ### How tests are pointed at a copy
 
 - Default runner: `supabase test db --db-url <copy url>`. The Supabase CLI takes a connection string, so it runs the same pgTAP suite against the copy.
-- No Supabase CLI: `--runner psql` runs each `.sql` file with psql against the copy. It installs pgTAP in the copy. A file fails on a non-zero exit, a `not ok` line, or a plan mismatch.
-- Any other command: `--test "pnpm test:rls"`. The copy is passed as `$DATABASE_URL`, `$SABOTEUR_DB_URL`, the `PG*` variables, and as `{{db_url}}` inside the command string. The command must exit non-zero on failure.
+- No Supabase CLI: `--runner psql` runs each `.sql` file with psql against the copy. It installs pgTAP in the copy. A file fails on a `not ok` line, a `# Looks like you failed` line, or a plan mismatch. A non-zero exit with none of those is an error.
+- Any other command: `--test "pnpm test:rls"`. The copy is passed as `$DATABASE_URL`, `$SABOTEUR_DB_URL`, the `PG*` variables, and as `{{db_url}}` inside the command string. The command must follow the exit code contract below.
+
+**Exit code contract for `--test`.** Exit `0` means every test passed. Exit `1` means a test failed. Any other exit code, or a kill by a signal, means the tests could not run. This is the pytest convention. A break counts as caught only on exit `1`. Your command must exit `1`, and only `1`, when an assertion fails. If it exits `2` for "could not parse a result", the break is an error.
 
 ### The first copy and open connections
 
@@ -142,7 +146,7 @@ npx rls-saboteur \
 Notes:
 
 - The `--db-url` role must own the tables, because each break is an `ALTER POLICY` or `DROP POLICY`. It does not need to be a superuser.
-- The `psql` runner installs the `pgtap` extension in its copies. If pgTAP is not installed on the server (`postgresql-<version>-pgtap`), use `--test "<command>"` instead. A plain SQL script that raises on failure works there. The runner does not need pgTAP in that mode.
+- The `psql` runner installs the `pgtap` extension in its copies. If pgTAP is not installed on the server (`postgresql-<version>-pgtap`), use `--test "<command>"` instead. A plain SQL script that raises on failure works there. Psql exits 3 when a script raises, so map it: `psql -v ON_ERROR_STOP=1 -f t.sql; c=$?; [ $c -eq 3 ] && exit 1; exit $c`. The runner does not need pgTAP in that mode.
 - Tenancy through `current_setting('app.tenant_id')` is fully covered, except one break kind: "auth.uid() compared with the wrong column" is generated only for `auth.uid()`. A policy that reads a setting gets every other break.
 
 ## Checks that need no tests
@@ -182,7 +186,7 @@ A `FAIL` makes the exit code 1.
 
 Exit codes: `0` passed, `1` below the threshold or a check failed, `2` could not check (tests fail unchanged, no tests, refused database, no connection).
 
-The score is caught divided by caught plus missed. Breaks that could not be applied, timed out, or were skipped by config are listed in the report and not counted.
+The score is caught divided by caught plus missed. Breaks that could not be applied, errored, timed out, or were skipped by config are listed in the report and not counted. If any break errored, the run prints a warning, because the score may be too high. Fix the cause and run again.
 
 `--only-related` is faster on big suites. It maps test files to tables by the table name appearing in the file. A test that reaches a table only through a function is not mapped, so use it when your tests name their tables.
 
