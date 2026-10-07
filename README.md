@@ -1,5 +1,7 @@
 # RLS Saboteur
 
+[![CI](https://github.com/mattmuller/rls-saboteur/actions/workflows/ci.yml/badge.svg)](https://github.com/mattmuller/rls-saboteur/actions/workflows/ci.yml)
+
 Your Supabase RLS tests pass. This tool checks whether they would fail if a policy broke.
 
 It breaks each row level security policy on purpose, one at a time, and runs your tests. Every break the tests did not notice is listed as **missed**. A missed break is a real hole: a policy that could go wrong with no test to say so.
@@ -118,6 +120,31 @@ If no copy can be made, it stops with exit 2 and names both fixes. It never fall
 
 On the demo project, 42 breaks took about 35 seconds on copies with `--jobs 2`, and about 90 seconds in place.
 
+## Plain Postgres (no Supabase)
+
+Nothing in the tool needs Supabase. Without it you must say three things the Supabase defaults would have said for you:
+
+```sh
+npx rls-saboteur \
+  --db-url postgres://app_owner:secret@127.0.0.1:5432/mydb \
+  --admin-url postgres://postgres:secret@127.0.0.1:5432/postgres \
+  --runner psql \
+  --tests-dir tests
+```
+
+| Flag | Why you need it without Supabase |
+|---|---|
+| `--db-url` | There is no `supabase/config.toml` to read the port from. |
+| `--runner psql` | Without it the tool uses the Supabase CLI whenever it is installed. `psql` must be on your PATH. |
+| `--tests-dir <dir>` | The default directory is `supabase/tests`. |
+| `--admin-url <superuser url>` | Only when your `--db-url` role cannot `CREATE DATABASE`, or other sessions stay connected. The zero-config superuser fallback applies to a local Supabase only. A superuser `--db-url` works without it. |
+
+Notes:
+
+- The `--db-url` role must own the tables, because each break is an `ALTER POLICY` or `DROP POLICY`. It does not need to be a superuser.
+- The `psql` runner installs the `pgtap` extension in its copies. If pgTAP is not installed on the server (`postgresql-<version>-pgtap`), use `--test "<command>"` instead. A plain SQL script that raises on failure works there. The runner does not need pgTAP in that mode.
+- Tenancy through `current_setting('app.tenant_id')` is fully covered, except one break kind: "auth.uid() compared with the wrong column" is generated only for `auth.uid()`. A policy that reads a setting gets every other break.
+
 ## Checks that need no tests
 
 These run on every invocation, and alone with `--checks-only`. They read the catalogue and call nothing.
@@ -208,6 +235,29 @@ It starts the database container only, runs the tool, writes the report to the j
 - `version` defaults to the version the action release ships with, and `supabase/setup-cli` is pinned. Pin the action itself to a tag or a commit.
 - The release step must keep the `version` default in `action.yml` equal to `package.json`.
 
+## Tested against
+
+`npm run test:matrix` runs six synthetic databases end to end, on PostgreSQL 16 and 17 (official `postgres` images plus pgTAP). Each fixture has its own tests and an `expected.json` that lists every break that must be caught and every break that must be missed. CI runs the same matrix.
+
+| Fixture | What it covers | Caught / missed |
+|---|---|---|
+| `plain-postgres` | No `auth` schema, no `anon` or `authenticated`. Tenancy by `current_setting`, roles `app_user` and `app_admin`, a non-superuser `--db-url` plus `--admin-url`, `--runner psql`. | 11 / 8 |
+| `supabase-style` | A stub `auth.uid()`, `anon` and `authenticated`, the owner-column swap. | 11 / 9 |
+| `restrictive-and-for-all` | RESTRICTIVE and PERMISSIVE on one table, `FOR ALL`, several roles per policy, `TO PUBLIC`. Driven by `--test` with a plain SQL script, and `--threshold`. | 13 / 4 |
+| `function-policies` | Policies calling SECURITY DEFINER helpers. One helper its role cannot EXECUTE, reported by the catalogue check and never called. | 3 / 8, 2 FAIL findings |
+| `odd-identifiers` | Mixed-case and spaced table and column names, a policy name with quotes and one with a slash, a non-public schema through `--schemas`. | 9 / 6 |
+| `partitioned` | RLS on a partitioned table and on its partitions. | 8 / 3 |
+
+The "missed" breaks are deliberate: each fixture leaves something untested so the test can fail if the tool stops finding it. The counts are identical on 16 and 17.
+
+Not covered by the matrix, so not promised:
+
+- The Supabase CLI runner (`supabase test db`). CI has no Supabase stack.
+- PostgreSQL older than 16, and managed services (RDS, Cloud SQL, Neon). A role that cannot create databases needs `--admin-url`.
+- Windows.
+- The column swap is only generated for `auth.uid()` comparisons (see Plain Postgres).
+- Policies on a partition are broken separately from the parent's, because Postgres applies them separately. A partition with no RLS of its own has nothing to break.
+
 ## Related tools
 
 - [SupaShield](https://github.com/Rodrigotari1/supashield) is a command-line tool that audits and lints RLS, maps access per role, snapshots policies, and exports pgTAP tests.
@@ -225,6 +275,7 @@ npm install
 npm test            # unit tests
 npm run build
 npm run test:e2e    # needs a local Postgres; set SABOTEUR_E2E_URL
+npm run test:matrix # needs Docker; starts and removes rls-saboteur-ci-16 and -17
 ```
 
 MIT. Copyright Matt Muller.
