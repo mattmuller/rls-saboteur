@@ -114,7 +114,7 @@ describe.skipIf(!superUrl)('the source database is never changed', () => {
     const held = await open(urlFor(DB, owner), 'my-app');
     let closed = false;
     held.on('error', () => (closed = true));
-    const r = spawnSync('node', args(['--yes']), { cwd: fixture, encoding: 'utf8' });
+    const r = spawnSync('node', args(['--yes', '--close-sessions']), { cwd: fixture, encoding: 'utf8' });
     expect(r.status, r.stdout + r.stderr).toBe(1);
     expect(r.stderr).toContain('my-app'); // the plan question lists the application names
     expect(r.stdout + r.stderr).toMatch(/Closed \d+ other connection/);

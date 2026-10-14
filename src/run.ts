@@ -6,6 +6,8 @@ import { createIsolation } from './isolation.js';
 import { Guard } from './guard.js';
 import { type Prompter, visible } from './confirm.js';
 import { hostOf, urlIsLocal } from './safety.js';
+import { describeFacts, readFacts, type ServerFacts } from './facts.js';
+import { DEFAULT_MAX_SIZE, formatSize } from './options.js';
 import { describeCatalogue, type RunModel } from './report.js';
 import { filesMentioning, type TestRun, type TestSuite } from './tests.js';
 import type { Break, BreakResult, Finding } from './types.js';
@@ -20,12 +22,22 @@ export interface RunOptions {
   timeoutMs: number;
   terminate: boolean;
   allowRemote?: boolean;
+  /** Refuse a source larger than this many bytes (default 2 GB). */
+  maxSizeBytes?: number;
+  /** --close-sessions: the owner has approved closing other sessions on the source. --yes does not do this. */
+  closeSessions?: boolean;
+  /** Switch off outbound HTTP inside the copies (default true). */
+  isolateNetwork?: boolean;
   /** Asks the owner. Every question defaults to No. */
   confirm: Prompter;
   /** The test command when it came from .rls-saboteur.json rather than --test. */
   testFromConfig?: string;
   adminUrl?: string;
   adminNote?: string;
+  /** Names (never values) of environment variables that are removed from the test environment. */
+  removedEnv?: string[];
+  /** Names of .env files in the project that mention a database. The test framework may read them itself. */
+  envFiles?: string[];
   onlyRelated: boolean;
   checksOnly: boolean;
   dryRun: boolean;
@@ -65,6 +77,8 @@ export async function run(o: RunOptions): Promise<RunOutput> {
   const client = await sourceGuard.connect(o.dbUrl);
   let findings: Finding[];
   let breaks: Break[];
+  let facts: ServerFacts | undefined;
+  let factsError: string | undefined;
   try {
     const cat = await readCatalogue(client, o.schemas);
     Object.assign(model, describeCatalogue(cat));
@@ -73,6 +87,12 @@ export async function run(o: RunOptions): Promise<RunOutput> {
     const gen = generateBreaks(cat);
     breaks = gen.breaks;
     model.unparsed = gen.unparsed;
+    try {
+      facts = await readFacts(client);
+      model.serverFacts = describeFacts(facts, decodeURIComponent(new URL(o.dbUrl).pathname.slice(1)));
+    } catch (e) {
+      factsError = (e as Error).message;
+    }
   } finally {
     await client.end().catch(() => {});
   }
@@ -104,6 +124,32 @@ export async function run(o: RunOptions): Promise<RunOutput> {
     return { model, breaks };
   }
 
+  if (todo.length === 0 && model.policyCount > 0) {
+    model.couldNotCheck =
+      `no break was run, although the database has ${model.policyCount} polic${model.policyCount === 1 ? 'y' : 'ies'}. ` +
+      (o.filter ? `--filter "${visible(o.filter)}" matched no break, or every match was skipped by ${CONFIG_FILE}. ` : breaks.length === 0 ? 'No break could be generated for them. ' : `Every break was skipped by ${CONFIG_FILE}. `) +
+      `A run that checked nothing is not a pass.`;
+    model.durationMs = Date.now() - started;
+    return { model, breaks };
+  }
+
+  // Size and server facts come from the server itself, before anything is copied.
+  const limit = o.maxSizeBytes ?? DEFAULT_MAX_SIZE;
+  if (!facts) {
+    model.couldNotCheck = `could not read the size of the database from the server (${scrubSecrets(factsError ?? 'no answer', [o.dbUrl])}), so it will not be copied.`;
+    model.durationMs = Date.now() - started;
+    return { model, breaks };
+  }
+  if (facts.sizeBytes > limit) {
+    const jobsN = Math.max(1, o.jobs);
+    model.couldNotCheck =
+      `the database is ${facts.sizePretty}, larger than the limit of ${formatSize(limit)}. ` +
+      `Copying it locks it for the length of the copy and needs about ${formatSize(facts.sizeBytes * (jobsN + 1))} of free disk ((jobs + 1) x its size, here ${jobsN + 1} x). ` +
+      `Pass --max-size <size> (for example --max-size ${formatSize(facts.sizeBytes * 2).replace(' ', '')}) to allow it. Nothing was copied.`;
+    model.durationMs = Date.now() - started;
+    return { model, breaks };
+  }
+
   // Nothing below this line touches the database except through copies. Ask first.
   const dbName = decodeURIComponent(new URL(o.dbUrl).pathname.slice(1));
   const local = urlIsLocal(o.dbUrl);
@@ -116,7 +162,20 @@ export async function run(o: RunOptions): Promise<RunOutput> {
   }
   const planText =
     `Plan\n` +
-    `  Database: ${visible(dbName)} on ${visible(scrubSecrets(hostOf(o.dbUrl), [o.dbUrl]))} (${local ? 'local' : 'NOT local'})\n` +
+    `  Database: ${visible(dbName)} on ${visible(scrubSecrets(hostOf(o.dbUrl), [o.dbUrl]))} (${local ? 'local' : 'NOT local'}; that is the host name only, the lines below come from the server)\n` +
+    describeFacts(facts, dbName).map((l) => `  ${l}\n`).join('') +
+    `  Note: outbound HTTP from the copy ${o.isolateNetwork === false ? 'is NOT switched off (--no-isolate-network was given)' : 'is switched off'}.\n` +
+    `  Test environment: ${
+      o.removedEnv?.length
+        ? `${o.removedEnv.length} variable(s) that name a database or Supabase project are removed (${o.removedEnv.map(visible).join(', ')}); DATABASE_URL, SABOTEUR_DB_URL and PG* point at the copy.`
+        : 'no variable that names a database or Supabase project was set; DATABASE_URL, SABOTEUR_DB_URL and PG* point at the copy.'
+    }\n` +
+    (o.envFiles?.length
+      ? `  Warning: ${o.envFiles.map(visible).join(', ')} in this directory mention a database. Your test framework may read ${o.envFiles.length === 1 ? 'it' : 'them'} itself and reach a database other than the copy; this tool does not control that.\n`
+      : '') +
+    (suite.mode === 'custom'
+      ? ''
+      : `  Note: the test files are your code. They run with the rights of your database user on this server, so a \\c or dblink inside one can reach other databases there.\n`) +
     `  It will: make temporary copies of it, break ${todo.length} policies in the copies, run: ${visible(suite.description)}\n` +
     `  It will not change this database.\n` +
     `Continue? (y/N)`;
@@ -128,10 +187,13 @@ export async function run(o: RunOptions): Promise<RunOutput> {
     sourceUrl: o.dbUrl,
     terminate: o.terminate,
     allowRemote: o.allowRemote,
+    isolateNetwork: o.isolateNetwork,
     confirmTerminate: (n, apps, db) =>
-      o.confirm.ask(
+      o.confirm.askSeparate(
         `${n} other connection(s) are open to ${visible(db)} (${apps.length ? apps.map(visible).join(', ') : 'no application name'}). Close them for a moment? They reconnect by themselves. (y/N)`,
-        `closing ${n} other connection(s) to "${visible(db)}" for a moment (local database only)`
+        `closing ${n} other connection(s) to "${visible(db)}" for a moment (local database only)`,
+        Boolean(o.closeSessions),
+        '--close-sessions'
       ),
     adminUrl: o.adminUrl,
     prepareMaster: suite.prepare ? (url) => suite.prepare!(url) : undefined

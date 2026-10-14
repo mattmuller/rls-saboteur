@@ -27,7 +27,7 @@ export function isLocalHost(host: string | undefined | null): boolean {
 export const REMOTE_FLAG = '--allow-remote-i-understand-this-locks-tables';
 
 /** Environment variables that can redirect a connection that does not name its own host. */
-const REDIRECT_ENV = ['PGHOST', 'PGHOSTADDR', 'PGSERVICE', 'PGSERVICEFILE'];
+const REDIRECT_ENV = ['PGHOST', 'PGHOSTADDR', 'PGSERVICE', 'PGSERVICEFILE', 'PGOPTIONS', 'PGTARGETSESSIONATTRS'];
 
 function safeDecode(s: string): string {
   try {

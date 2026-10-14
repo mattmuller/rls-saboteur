@@ -1,4 +1,5 @@
 import type { BreakResult, Catalogue, Finding, Policy } from './types.js';
+import { visible } from './confirm.js';
 
 export interface RunModel {
   database: string;
@@ -19,6 +20,8 @@ export interface RunModel {
   threshold: number;
   jobs: number;
   durationMs: number;
+  /** What the server says about the source: version, address, size, other sessions. */
+  serverFacts?: string[];
   /** Set when the run could not check (exit 2). */
   couldNotCheck?: string;
   /** Only the checks that need no tests were run. */
@@ -50,9 +53,37 @@ export function score(results: BreakResult[]): Score {
   };
 }
 
+/**
+ * Fields that may legitimately hold several lines (test output, SQL, notes). In these, our own line breaks
+ * stay and every other control character is written out. Every other string is one line.
+ */
+const MULTILINE_KEYS = new Set(['couldNotCheck', 'notes', 'note', 'apply', 'detail', 'qual', 'withCheck']);
+
+function clean(value: unknown, key: string): unknown {
+  if (typeof value === 'string') {
+    return MULTILINE_KEYS.has(key) ? value.split('\n').map(visible).join('\n') : visible(value);
+  }
+  if (Array.isArray(value)) return value.map((v) => clean(v, key));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, clean(v, k)]));
+  }
+  return value;
+}
+
+/**
+ * Names, expressions and test output come from the database and from subprocesses. Before they are printed or
+ * written to the report, every control character, escape sequence, bidi override, line separator and
+ * zero-width character is written out visibly (\x1b, \u2028 ...).
+ */
+export function sanitizeModel(m: RunModel): RunModel {
+  return clean(m, '') as RunModel;
+}
+
 export function exitCode(m: RunModel): 0 | 1 | 2 {
   if (m.couldNotCheck) return 2;
   const s = score(m.results);
+  // Every break errored or was skipped: nothing was decided, and "n/a" is not a pass.
+  if (!m.checksOnly && m.policyCount > 0 && s.percent === null) return 2;
   if (m.findings.some((f) => f.severity === 'FAIL')) return 1;
   if (s.percent !== null && s.percent < m.threshold) return 1;
   return 0;
@@ -89,7 +120,8 @@ function hint(m: RunModel, r: BreakResult): string {
 
 export const INLINE_MISSED = 3;
 
-export function consoleReport(m: RunModel, color: boolean): string {
+export function consoleReport(raw: RunModel, color: boolean): string {
+  const m = sanitizeModel(raw);
   const c = (code: string, s: string) => (color ? `\x1b[${code}m${s}\x1b[0m` : s);
   const red = (s: string) => c('31;1', s);
   const green = (s: string) => c('32', s);
@@ -155,7 +187,8 @@ export function consoleReport(m: RunModel, color: boolean): string {
   return out.join('\n');
 }
 
-export function markdownReport(m: RunModel): string {
+export function markdownReport(raw: RunModel): string {
+  const m = sanitizeModel(raw);
   const s = score(m.results);
   const lines: string[] = [];
   lines.push('# RLS Saboteur report', '');

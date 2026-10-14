@@ -19,16 +19,33 @@ Against a local Supabase stack, you may need `--admin-url postgres://supabase_ad
 
 ## What it will never do
 
-Your database is never touched. The tool works only on temporary copies. These are the guarantees, each with the test that proves it.
+It never changes the database you point it at. It does read it: your rows are copied into temporary databases on the same server, which are dropped afterwards.
 
-- **It never changes the database you point it at.** It sends that database nothing but plain reads (`SELECT`). The connection is also opened read-only, so Postgres itself refuses a write. Proof: `guard: the source database is read-only` (test/guard.test.ts) and `source-untouched` (test/matrix/source-untouched.test.ts, which compares policies, table flags, the database row, its settings and its roles before and after a full run).
-- **It never changes a setting of that database.** There is no `ALTER DATABASE` step. Proof: `guard: the admin connection > refuses anything else, including changing the source database`.
-- **It only ever drops databases it made itself.** Every copy is labelled `rls-saboteur copy <random token>` the moment it exists. A drop is allowed only when the name starts with `saboteur_`, is not your database, and the label matches this run (or an earlier run whose process has died). Proof: `guard: the admin connection` (refuses unprefixed, source and unlabelled names) and `droppable`.
-- **It never closes your connections on a remote host, or when you gave `--no-terminate` or the remote flag.** On a local database it may close other sessions for a moment to take the first copy, and only after you say yes. Proof: `refuses to close sessions when terminating is not allowed` and `no-terminate-with-remote-flag`.
-- **A crash cannot leave your database changed.** There is nothing to undo. Proof: `crash-during-first-copy` kills the process with `kill -9` in the middle of the first copy, then checks the source accepts connections and is unchanged.
-- **It never runs without asking, unless you say `--yes`.** Proof: `confirmation steps` (test/confirm.test.ts), `run asks before it copies anything` (test/run-confirm.test.ts) and `no-prompt-without-yes`.
+How this is enforced: every connection the tool opens goes through one guard (`src/guard.ts`). The guard is an allowlist of the statements the tool itself sends. On your database it allows plain reads (`SELECT`) and nothing else, and the session is also read-only, so Postgres itself refuses a write. On the admin connection it allows only `CREATE DATABASE`, `COMMENT ON DATABASE`, `DROP DATABASE`, closing sessions on your database and cancelling the tool's own `CREATE DATABASE`, each in one exact shape. The guard does not inspect your test files or your test command: they are your code (see "What a copy can still do").
 
-What this does not cover: the test command you give it (`--test`, or the `test` value in `.rls-saboteur.json`) is your code and runs as you. It is passed the address of a copy only, but it is a shell command. The tool shows it to you before it runs when it comes from the config file.
+These are the guarantees. Each names the tests that check it, by their exact names. Unit tests run with `npx vitest run` (test/guard.test.ts and test/hardening.test.ts). Matrix tests run against real PostgreSQL 16 and 17 with `npm run test:matrix` (test/matrix/hardening.test.ts and test/matrix/source-untouched.test.ts).
+
+- **It never changes the database you point it at.** It sends that database nothing but plain reads. Proof: `guard: the source database is read-only` (unit) and `source-untouched: a full run leaves the source catalogue byte for byte the same` (matrix, which compares policies, table flags, the database row, its settings and its roles before and after a full run).
+- **It never changes a setting of that database.** There is no `ALTER DATABASE` step. Proof: `guard: the admin connection > refuses anything else, including changing the source database` (unit) and `source-untouched-busy: closing other sessions leaves the source settings alone, and says so` (matrix).
+- **It only ever drops databases it made itself.** A copy is named `saboteur_<host id>_<pid>_<run token>_tpl` or `..._<n>`, so its maker is in its name even if its label was never written. It is also labelled `rls-saboteur copy <run token> host=<host id>` once it exists. A drop is allowed only when the database is not yours, and it was made by this run, or by a process of this host that is dead. A copy made by another host (the host id covers the machine, the boot and, on Linux, the pid namespace) or by a live process is never dropped. A `--db-url` whose database name looks like a saboteur copy is refused. Proof: `guard: the admin connection`, `droppable (the one rule behind every drop)`, `F: a pid is only judged on the host that owns it`, `1a: the identity of a copy is in its NAME, so a missing label does not hide it` (unit) and `F: only dead copies of this host are swept`, `an unlabelled copy of a dead pid on this host is swept; one of another host, or of a live pid, is not`, `a --db-url that names a saboteur copy is refused with exit 2` (matrix).
+- **An interrupt leaves no copy behind.** On Ctrl-C or SIGTERM during `CREATE DATABASE`, the tool cancels its own `CREATE` (`pg_cancel_backend`, allowed only for the backend running it), waits up to 30 seconds for the server to stop, and drops the copy. If it cannot, it prints the database name and the `drop database` command and exits 1. After `kill -9` the server may finish the copy; the next run drops it by its name. Proof: `H4: an interrupt during CREATE DATABASE cancels it, waits for it, then drops by name` and `1b: pg_cancel_backend is allowed only for the backend running our own CREATE` (unit), and in the matrix `1: an interrupted copy never leaves a database behind` (SIGINT and SIGTERM during the first copy, SIGINT during a per-break copy, and `kill -9`, each on a source large enough that the copy takes more than a second).
+- **Every connection and every test runner lands on the database it names, and no other.** A `--db-url` or `--admin-url` with a connection parameter in its query string (`dbname`, `host`, `options`, `user`, `port`, `service` and the like) is refused with exit 2, because psql and the Supabase CLI let those override the URL. Every copy URL is built from parsed parts. Every connection checks `current_database()`, and a test runner is started with the copy in `PGHOST`, `PGPORT`, `PGDATABASE` and `PGUSER` and a URL without a query string. Proof: `A: connection URLs`, `A: every connection must land on the database it names` (unit) and, against real psql, `the psql runner installs pgTAP only in the database named by the path, never in ?dbname=` and `the CLI refuses ?dbname= on --db-url with exit 2 and creates nothing` (matrix; vitest prints `dbname` in place of `%s`).
+- **A test command sees no variable that names another database.** The tool removes every environment variable whose name contains `DATABASE`, `DB_URL`, `DBURL`, `DB_CONNECTION`, `DIRECT_URL`, `POSTGRES`, `SUPABASE` or `SERVICE_ROLE` (any case), and every `PG*` variable. Then it sets `DATABASE_URL`, `SABOTEUR_DB_URL` and `PG*` to the copy. The plan lists the removed names, never the values. **Files your test framework loads itself are not controlled.** A `.env`, `.env.local`, `.env.test` or `.env.test.local` in the working directory that mentions `DATABASE_URL`, `SUPABASE` or `POSTGRES` is named in the plan as a warning. Proof: `2: the test command environment holds no variable that names another database or project`, `D: the test command environment` (unit) and `removes other database variables and points DATABASE_URL and PG* at the copy`, `2: the plan names what was removed from the test environment, and the .env files it cannot control` (matrix).
+- **`--admin-url` must be the server that holds the source.** The tool compares the cluster system identifier, or the server address, port and data directory, and refuses a different server with exit 2 before anything is created. Proof: `C: same server` (unit) and `C: --admin-url must be the same server as --db-url` (matrix, which starts a second throwaway server).
+- **It never closes your connections without a separate yes, and only on a server it has proven is yours.** Closing other sessions needs its own approval: the question, or `--close-sessions`. `--yes` does not give it. It is never done on a remote host, with `--no-terminate`, or with the remote flag. It is also refused when `--admin-url` can be tied to the source only by host and port; the system identifier or the data directory must match. The closing statement is bound to the name of your database. Proof: `B: closing sessions needs its own approval`, `H3: a busy source that may not be closed is rejected without any DDL`, `4: closing sessions only on the source database, and never once denied` (unit) and `--yes alone does not close other sessions; --close-sessions does`, `no-terminate-with-remote-flag: the remote flag never closes a session` (matrix).
+- **It does not copy a large database by surprise.** A source over 2 GB is refused with exit 2 unless you pass `--max-size <size>`. Copying locks the source for the length of the copy and needs about (jobs + 1) x its size in free disk. The plan shows the server version, the size, the other sessions and the address the server reports, not only the host name you typed. Proof: `a source above --max-size is refused, with exit 2, before any copy` and `the plan lists server version, source size, other sessions and the server address` (matrix).
+- **Outbound HTTP from a copy is switched off** unless you pass `--no-isolate-network`. In the copies, never in your database, every function of schema `net` and of the `pg_net` and `http` extensions keeps its signature and does nothing, so triggers and database webhooks cannot call out. Proof: `E: outbound HTTP from the copy is switched off` (matrix).
+- **Names from the database are never printed raw.** Control characters, escape sequences, bidirectional overrides, line and paragraph separators and zero-width characters in policy, table, role and function names, expressions and test output are written out visibly (`\x1b`) in the console and the Markdown report. Proof: `G: visible()` (unit) and `an escape sequence in a policy name never reaches the console or the report as a control character` (matrix).
+- **A bad value is never a default.** `--threshold` outside 0 to 100, `--jobs` below 1 or not whole, a bad `--timeout`, `--max-size` or `--runner` exit 2. A run in which no break was decided (none run, all skipped, all errored) exits 2, not 0. Proof: `H1: option values`, `H1: a run that decided nothing is not a pass`, `6: --runner is checked` (unit) and `H1: values are checked, and a run that checked nothing is not a pass` (matrix).
+- **A crash cannot leave your database changed.** There is nothing to undo. Proof: `crash-during-first-copy: kill -9 mid-copy leaves the source open and unchanged` (matrix).
+- **It never runs without asking, unless you say `--yes`.** Proof: `confirmation steps` (test/confirm.test.ts), `run asks before it copies anything` (test/run-confirm.test.ts) and `no-prompt-without-yes: a run with no terminal and no --yes exits 2 and makes no copy` (matrix).
+
+What a copy can still do, and what this does not cover:
+
+- **Test files run with your database user's rights.** The pgTAP files (`supabase test db` or `--runner psql`) are your code. They run as the user in `--db-url` on the same server as your database. A `\c otherdb` or a `dblink` call inside a test file can reach other databases on that server, with that user's rights. The tool cannot prevent this without a separate role. The plan says so. Read your test files before you run them.
+- A copy holds a full copy of your data and runs your SQL. Any function in it runs as it would in your database. Outbound HTTP is off by default; with `--no-isolate-network` it is on. Connections opened by `dblink`, `postgres_fdw`, `plpython3u`, `plperlu`, `pltclu` or `file_fdw` are **not** switched off; the report lists these extensions in a note when the database has them.
+- The test command you give it (`--test`, or the `test` value in `.rls-saboteur.json`) is your code and runs as you. Its environment holds no variable that names another database, but it is a shell command: it can read files such as `~/.pgpass`, `pg_service.conf` or a `.env` file, and open any network connection. The tool shows a command from the config file to you before it runs.
+- "Local" is decided from the host name in the URL. An SSH tunnel or a cloud proxy on `127.0.0.1` looks local. That is why the plan prints what the server itself reports, and why a source over 2 GB needs `--max-size`.
 
 Versions before 0.2.0 had an `--isolation in-place` mode that edited your real database. It was removed in 0.2.0.
 
@@ -38,7 +55,11 @@ Before anything is copied, the tool prints a plan and waits for you:
 
 ```
 Plan
-  Database: postgres on 127.0.0.1 (local)
+  Database: postgres on 127.0.0.1 (local; that is the host name only, the lines below come from the server)
+  Server: PostgreSQL 17.6. Server reports address 172.18.0.2 port 5432.
+  Size of "postgres": 8329 kB
+  Other sessions: 0
+  Note: outbound HTTP from the copy is switched off.
   It will: make temporary copies of it, break 42 policies in the copies, run: supabase/tests/*.sql  (pgTAP, run with supabase test db)
   It will not change this database.
 Continue? (y/N)
@@ -47,10 +68,10 @@ Continue? (y/N)
 The default is No. An empty answer is No.
 
 1. **The plan.** As above.
-2. **Closing other sessions.** If the first copy needs it (local databases only): `N other connection(s) are open to <db> (<application names>). Close them for a moment? They reconnect by themselves. (y/N)`. No stops the run with the explanation.
+2. **Closing other sessions.** If the first copy needs it (local databases only): `N other connection(s) are open to <db> (<application names>). Close them for a moment? They reconnect by themselves. (y/N)`. No stops the run with the explanation. **`--yes` does not answer this question.** With no terminal, pass `--close-sessions` for it, or the run exits 2 and names the flag.
 3. **A test command from `.rls-saboteur.json`.** The exact command is shown and you are asked before it runs. A command passed with `--test` on the command line is not asked about, because you typed it.
 
-With no terminal (stdin or stdout is not a TTY, or `CI=true`) the tool never prompts and never waits. Without `--yes` it exits 2 and names `--yes`. `--yes` approves all three questions, so pass it only for a run whose plan you have read. The GitHub Action passes `--yes`, because the workflow is your own.
+With no terminal (stdin or stdout is not a TTY, or `CI=true`) the tool never prompts and never waits. Without `--yes` it exits 2 and names `--yes`. `--yes` approves the plan and a test command from the config file, so pass it only for a run whose plan you have read. It does not approve closing sessions: that needs `--close-sessions`. The GitHub Action passes `--yes`, because the workflow is your own. It passes `--close-sessions` only when it started the throwaway Supabase stack itself (`start-supabase: true`), unless you set `close-sessions` yourself.
 
 ## Before and after
 
@@ -151,7 +172,7 @@ Score  100%   exit 0 (threshold 100%)
 
 Postgres refuses to copy a database while anyone else is connected to it. A running local Supabase always has connections open (auth, REST, realtime), so a direct copy fails with "source database is being accessed by other users".
 
-RLS Saboteur handles this once, at the start, on a local database only, and only after you answer yes. It closes the other connections for about a second, makes the master template, and lets them reconnect. It prints a note when it did so. It changes no setting of your database to do this. With `--no-terminate`, with the remote flag, or on a remote host it never closes anything: a busy database is an error that tells you how to free it.
+RLS Saboteur handles this once, at the start, on a local database only, and only after you answer yes. With your separate yes (the question, or `--close-sessions`; `--yes` is not enough) it closes the other connections for about a second, makes the master template, and lets them reconnect. It prints a note when it did so. It changes no setting of your database to do this. With `--no-terminate`, with the remote flag, or on a remote host it never closes anything: a busy database is an error that tells you how to free it.
 
 A stock local Supabase stack has one more catch. The cron scheduler keeps a connection open as a superuser, and the normal `postgres` role cannot close it. So when the host is local and `supabase/config.toml` exists, RLS Saboteur tries the CLI's documented local superuser (`supabase_admin`, local default password) on the same host and port. It uses that role only to copy and drop databases, and prints one line saying so. If that login fails, pass your own with `--admin-url <superuser url>`.
 
@@ -163,6 +184,7 @@ If no copy can be made, it stops with exit 2 and your database is untouched. Pas
 - **In CI, never pass untrusted text to the Action's `extra-args` input.** It becomes command-line options. Pull request titles, branch names and comment bodies are untrusted. The same goes for the `test` input.
 - **Give the workflow the least permission.** Set `permissions: contents: read` on any workflow that uses the Action.
 - Passwords are passed to `psql` and the Supabase CLI in `PGPASSWORD`, not on the command line.
+- The Action checks its inputs before it runs anything: `version` must look like `0.2.0`, `threshold` must be 0 to 100, `jobs` a whole number of 1 or more, `close-sessions` empty, `true` or `false`.
 
 On the demo project, 42 breaks took about 35 seconds on copies with `--jobs 2`.
 
@@ -210,7 +232,7 @@ A `FAIL` makes the exit code 1.
 --db-url <url>        Database to read. Default: local Supabase from supabase/config.toml
 --schemas <a,b>       Schemas to cover. Default: public
 --test "<command>"    Run this command instead of "supabase test db"
---runner <name>       auto, supabase or psql
+--runner <name>       auto, supabase or psql (anything else exits 2)
 --jobs <n>            Breaks run in parallel on copies. Default: 2
 --threshold <pct>     Fail below this score. Default: 100
 --only-related        Per break, run only the test files that mention the table
@@ -218,7 +240,10 @@ A `FAIL` makes the exit code 1.
 --admin-url <url>     Superuser URL used only to copy and drop databases
 --tests-dir <dir>     Directory of pgTAP files. Default: supabase/tests
 --no-terminate        Never close other connections for the first copy
---yes                 Approve the plan, closing local sessions and a config-file test command without asking (needed without a terminal)
+--yes                 Approve the plan and a config-file test command without asking (needed without a terminal). Does not approve closing sessions.
+--close-sessions      Approve closing other sessions on a local source for a moment, to take the first copy. Needs its own flag.
+--max-size <size>     Allow a source larger than 2GB (default limit 2GB), for example --max-size 5GB
+--no-isolate-network  Leave outbound HTTP on inside the copies (default: switched off)
 --filter <text>       Only breaks whose id contains this text
 --checks-only         Only the checks that need no tests
 --dry-run             List the breaks and stop
@@ -250,8 +275,8 @@ Every skip needs a written reason, and skipped breaks are listed in the report.
 ## Safety
 
 - It refuses any database that is not local (`localhost`, `127.0.0.1`, `::1`, the Docker host) unless you pass `--allow-remote-i-understand-this-locks-tables`. Breaking a policy on a live database takes a lock and stalls it.
-- It never reads your rows. It reads the catalogue and runs your own tests.
-- Copies are named `saboteur_<pid>_<n>`, labelled, and dropped after each break. A run that dies leaves none behind that the next run does not sweep. A copy is swept only if it is labelled and its process is dead. See "What it will never do".
+- It never changes your database. It reads the catalogue, and your rows are copied into temporary databases on the same server, which are dropped afterwards. It runs your own tests on the copies.
+- Copies are named `saboteur_<host id>_<pid>_<run token>_<n>`, labelled, and dropped after each break. A run that dies leaves none behind that the next run does not sweep. A copy is swept only if its name or label says it was made by this host and its process is dead. See "What it will never do".
 - Test output is scrubbed of connection strings and passwords before it reaches a report.
 
 ## Claude Code
@@ -276,6 +301,8 @@ Every skip needs a written reason, and skipped breaks are listed in the report.
 It starts the database container only, runs the tool, writes the report to the job summary, and fails the job below the threshold.
 
 The Action passes `--yes`. A CI run has no terminal to ask on, and the workflow file is your own approval of the plan: temporary copies of the CI database, which is thrown away with the job.
+
+The Action passes `--close-sessions` by default only when `start-supabase` is `true` (the default), because the database is then a throwaway stack that the Action started itself. With `start-supabase: false` the database is yours, so the default is no. Set `close-sessions: true` or `false` to override either way.
 
 ### Security
 

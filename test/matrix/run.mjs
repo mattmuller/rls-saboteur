@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // npm run test:matrix: build the CLI, start rls-saboteur-ci-16 and -17 (official postgres images plus
 // pgTAP, see test/docker/Dockerfile), run the fixture matrix against each, and stop them again.
-// Only containers named rls-saboteur-ci-* are ever created or removed. Volumes are never touched.
+// Each version also gets a SECOND throwaway server (rls-saboteur-ci-b-<v>, port 55500+v) so that the different-server
+// test (SABOTEUR_MATRIX_URL_B) really runs. Only containers named rls-saboteur-ci-* are ever created or removed.
+// Volumes are never touched.
 import { spawnSync } from 'node:child_process';
 import { cpus, loadavg } from 'node:os';
 import { join } from 'node:path';
@@ -9,7 +11,9 @@ import { join } from 'node:path';
 const root = join(import.meta.dirname, '..', '..');
 const versions = (process.env.MATRIX_VERSIONS ?? '16,17').split(',').map((v) => v.trim()).filter(Boolean);
 const port = (v) => 55400 + Number(v);
+const portB = (v) => 55500 + Number(v);
 const name = (v) => `rls-saboteur-ci-${v}`;
+const nameB = (v) => `rls-saboteur-ci-b-${v}`;
 const image = (v) => `rls-saboteur-ci-pg:${v}`;
 
 function sh(cmd, args, opts = {}) {
@@ -25,8 +29,24 @@ if (busy) console.log(`load ${loadavg()[0].toFixed(1)} on ${cpus().length} cores
 
 function removeContainer(v) {
   // The name check is the safety: only our own containers are ever removed.
-  if (!name(v).startsWith('rls-saboteur-ci-')) return;
-  quiet('docker', ['rm', '-f', name(v)]);
+  for (const n of [name(v), nameB(v)]) {
+    if (!n.startsWith('rls-saboteur-ci-')) continue;
+    quiet('docker', ['rm', '-f', n]);
+  }
+}
+
+function startServer(v, n, p) {
+  const r = sh('docker', [
+    'run', '-d', '--name', n, '-e', 'POSTGRES_PASSWORD=postgres', '-p', `127.0.0.1:${p}:5432`,
+    image(v), '-c', 'cluster_name=rls-saboteur-ci', '-c', 'fsync=off', '-c', 'max_connections=200'
+  ], { stdio: ['ignore', 'ignore', 'inherit'] });
+  if (r.status !== 0) throw new Error(`could not start ${n} (is port ${p} free?)`);
+}
+
+function isReady(n) {
+  // Ready means a TCP login from the host works, not only that the entrypoint's temporary server is up.
+  return quiet('docker', ['exec', n, 'pg_isready', '-h', '127.0.0.1', '-U', 'postgres']).status === 0 &&
+    quiet('docker', ['exec', n, 'psql', '-h', '127.0.0.1', '-U', 'postgres', '-Atc', "select current_setting('cluster_name')"]).stdout?.trim() === 'rls-saboteur-ci';
 }
 
 const started = [];
@@ -39,27 +59,28 @@ try {
     [c, a] = niced('docker', ['build', '--build-arg', `PG_MAJOR=${v}`, '-t', image(v), 'test/docker']);
     if (sh(c, a, { stdio: ['ignore', 'ignore', 'inherit'] }).status !== 0) throw new Error(`docker build failed for ${v}`);
     removeContainer(v);
-    const r = sh('docker', [
-      'run', '-d', '--name', name(v), '-e', 'POSTGRES_PASSWORD=postgres', '-p', `127.0.0.1:${port(v)}:5432`,
-      image(v), '-c', 'cluster_name=rls-saboteur-ci', '-c', 'fsync=off', '-c', 'max_connections=200'
-    ], { stdio: ['ignore', 'ignore', 'inherit'] });
-    if (r.status !== 0) throw new Error(`could not start ${name(v)} (is port ${port(v)} free?)`);
     started.push(v);
+    startServer(v, name(v), port(v));
+    startServer(v, nameB(v), portB(v));
   }
   for (const v of started) {
-    let ready = false;
-    for (let i = 0; i < 90 && !ready; i++) {
-      // Ready means a TCP login from the host works, not only that the entrypoint's temporary server is up.
-      ready = quiet('docker', ['exec', name(v), 'pg_isready', '-h', '127.0.0.1', '-U', 'postgres']).status === 0 &&
-        quiet('docker', ['exec', name(v), 'psql', '-h', '127.0.0.1', '-U', 'postgres', '-Atc', "select current_setting('cluster_name')"]).stdout?.trim() === 'rls-saboteur-ci';
-      if (!ready) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1000);
+    for (const n of [name(v), nameB(v)]) {
+      let ready = false;
+      for (let i = 0; i < 90 && !ready; i++) {
+        ready = isReady(n);
+        if (!ready) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1000);
+      }
+      if (!ready) throw new Error(`${n} did not become ready`);
     }
-    if (!ready) throw new Error(`${name(v)} did not become ready`);
   }
   for (const v of started) {
     console.log(`\n=== PostgreSQL ${v} (port ${port(v)}) ===`);
     const [vc, va] = niced('npx', ['vitest', 'run', '--config', 'vitest.matrix.config.ts']);
-    const r = sh(vc, va, { env: { ...process.env, SABOTEUR_MATRIX_URL: `postgres://postgres:postgres@127.0.0.1:${port(v)}/postgres` } });
+    const r = sh(vc, va, { env: {
+      ...process.env,
+      SABOTEUR_MATRIX_URL: `postgres://postgres:postgres@127.0.0.1:${port(v)}/postgres`,
+      SABOTEUR_MATRIX_URL_B: `postgres://postgres:postgres@127.0.0.1:${portB(v)}/postgres`
+    } });
     if (r.status !== 0) failed = true;
   }
 } catch (e) {

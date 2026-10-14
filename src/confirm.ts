@@ -6,8 +6,8 @@ export class ApprovalRequired extends Error {
     super(
       `Not running: this needs your approval and there is no terminal to ask on.\n` +
         `Needed: ${what}\n` +
-        `Pass --yes to approve it. --yes approves all three questions: the plan (temporary copies; your database is not changed), closing other sessions on a local database for a moment, ` +
-        `and running a test command that comes from .rls-saboteur.json.`
+        `Pass --yes to approve the plan (temporary copies; your database is not changed) and a test command that comes from .rls-saboteur.json. ` +
+        `--yes does NOT approve closing other sessions on your database: that needs its own flag, --close-sessions.`
     );
     this.name = 'ApprovalRequired';
   }
@@ -20,7 +20,7 @@ export class ApprovalRequired extends Error {
  * hostile .rls-saboteur.json cannot draw "npm test" over a different command.
  */
 export function visible(text: string): string {
-  return text.replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, (c) => {
+  return text.replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060\u2066-\u2069\ufeff]/g, (c) => {
     if (c === '\n') return '\\n';
     if (c === '\t') return '\\t';
     const code = c.charCodeAt(0);
@@ -38,6 +38,11 @@ export interface Prompter {
   readonly interactive: boolean;
   /** Ask a yes/no question. Default is No. Resolves false for anything but y or yes. */
   ask(question: string, needed: string): Promise<boolean>;
+  /**
+   * A question that --yes does NOT answer (closing other sessions on the database). It is approved by its own
+   * flag. Otherwise a person must answer it; with no terminal it throws ApprovalRequired naming that flag.
+   */
+  askSeparate(question: string, needed: string, flagApproved: boolean, flagName: string): Promise<boolean>;
   say(text: string): void;
 }
 
@@ -96,6 +101,16 @@ export function makePrompter(o: PrompterOptions): Prompter {
         return true;
       }
       if (!interactive) throw new ApprovalRequired(needed);
+      out.write(`${safeQuestion(question)} `);
+      const answer = (await nextLine()).trim();
+      return /^y(es)?$/i.test(answer);
+    },
+    async askSeparate(question, needed, flagApproved, flagName) {
+      if (flagApproved) {
+        out.write(`${safeQuestion(question)} yes (approved with ${flagName})\n`);
+        return true;
+      }
+      if (!interactive) throw new ApprovalRequired(`${needed}. Pass ${flagName} to approve it (--yes does not)`);
       out.write(`${safeQuestion(question)} `);
       const answer = (await nextLine()).trim();
       return /^y(es)?$/i.test(answer);

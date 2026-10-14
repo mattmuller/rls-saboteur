@@ -16,7 +16,13 @@ vi.mock('../src/guard.js', () => ({
   Guard: class {
     async connect() {
       events.push('read-source');
-      return { query: async () => ({ rows: [], rowCount: 0 }), end: async () => {} };
+      return {
+        query: async (sql: string) =>
+          /server_version/.test(sql)
+            ? { rows: [{ version: '17.0', addr: '127.0.0.1', port: 5432, bytes: '1000', pretty: '1000 bytes' }], rowCount: 1 }
+            : { rows: [], rowCount: 0 },
+        end: async () => {}
+      };
     }
   }
 }));
@@ -36,6 +42,11 @@ const prompter = (answer: boolean): Prompter & { asked: string[] } => {
   return {
     interactive: true, asked, say: () => {},
     ask: async (q) => {
+      asked.push(q);
+      events.push('ask');
+      return answer;
+    },
+    askSeparate: async (q) => {
       asked.push(q);
       events.push('ask');
       return answer;
@@ -112,5 +123,25 @@ describe('the prompter writes untrusted text visibly even if a caller forgets', 
     await pr.ask('Run this?\n  npm test\x1b]0;x\x07', 'x');
     expect(written).not.toContain('\x1b');
     expect(written).toContain('Run this?\n  npm test\\x1b]0;x\\x07');
+  });
+});
+
+describe('the plan tells the user what the test files and the environment can do', () => {
+  beforeEach(() => {
+    events.length = 0;
+  });
+  it('a pgTAP suite gets the note that test files run with the database user\'s rights; a custom command does not', async () => {
+    const p = prompter(false);
+    await run(base(p, { suite: { ...suite, mode: 'psql' as const, description: 'supabase/tests/*.sql  (pgTAP, run file by file with psql)' } }));
+    expect(p.asked[0]).toMatch(/the test files are your code\. They run with the rights of your database user on this server/);
+    const q = prompter(false);
+    await run(base(q));
+    expect(q.asked[0]).not.toMatch(/the test files are your code/);
+  });
+  it('lists the removed variable names and the .env files, never a value', async () => {
+    const p = prompter(false);
+    await run(base(p, { removedEnv: ['SUPABASE_SERVICE_ROLE_KEY', 'TEST_DATABASE_URL'], envFiles: ['.env.local'] }));
+    expect(p.asked[0]).toContain('SUPABASE_SERVICE_ROLE_KEY, TEST_DATABASE_URL');
+    expect(p.asked[0]).toMatch(/\.env\.local in this directory mention a database/);
   });
 });

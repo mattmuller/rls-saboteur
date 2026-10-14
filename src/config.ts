@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { urlIsLocal } from './safety.js';
+import { safeParams } from './urls.js';
 
 const LOCAL_DEFAULT_PASSWORDS = new Set(['postgres', 'password', 'supabase']);
 
@@ -95,10 +96,21 @@ export function redact(dbUrl: string): string {
   }
 }
 
-/** Swap the database name in a connection URL. */
+/**
+ * Build the URL of another database on the same server. The URL is made from parsed parts: user,
+ * password, host, port and the new database name. Only parameters that change how we talk (sslmode and
+ * the like) are carried over. A query parameter such as dbname, host or options is dropped, because a
+ * libpq runner would let it override the database written in the path.
+ */
 export function withDatabase(dbUrl: string, database: string): string {
-  const u = new URL(dbUrl);
+  const src = new URL(dbUrl);
+  const u = new URL(`${src.protocol}//placeholder`);
+  u.username = src.username;
+  u.password = src.password;
+  u.hostname = src.hostname;
+  u.port = src.port;
   u.pathname = '/' + encodeURIComponent(database);
+  for (const [k, v] of safeParams(src)) u.searchParams.append(k, v);
   return u.toString();
 }
 

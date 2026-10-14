@@ -6,8 +6,11 @@ import { CONFIG_FILE, discoverDbUrl, readFileConfig, scrubSecrets } from './conf
 import { REMOTE_FLAG, remoteRefusal, resolveConnection, stripRedirectEnv, urlIsLocal } from './safety.js';
 import { consoleReport, exitCode, jsonReport, markdownReport } from './report.js';
 import { run } from './run.js';
-import { discoverSuite } from './tests.js';
-import { Guard } from './guard.js';
+import { dbEnvRemovals, discoverSuite, envFileWarnings } from './tests.js';
+import { Guard, databaseOf, sourceNameProblem, verifyDatabase } from './guard.js';
+import { connectionParamProblem } from './urls.js';
+import { DEFAULT_MAX_SIZE, parseJobs, parsePercent, parseRunner, parseSeconds, parseSize } from './options.js';
+import { visible } from './confirm.js';
 import { ApprovalRequired, makePrompter } from './confirm.js';
 
 let knownUrl: string[] = [];
@@ -35,11 +38,17 @@ Options
   --isolation template  Kept for old scripts. Every run uses database copies. "in-place" was removed in 0.2.0.
   --admin-url <url>     Superuser URL used only to copy and drop databases. A local Supabase keeps a
                         superuser cron connection open; with this, copies (and --jobs) work.
+  --close-sessions      Approve closing other sessions on the database for a moment, to take the first copy.
+                        --yes does NOT approve this. Local database only; never with the remote flag.
+  --max-size <size>     Copy a source larger than 2GB. Default limit: 2GB. Copying locks the source for the
+                        copy's duration and needs about (jobs + 1) x its size in free disk.
+  --no-isolate-network  Leave outbound HTTP on inside the copies. Default: it is switched off (pg_net and http
+                        functions do nothing in a copy; the source is never touched).
   --no-terminate        Never close other connections to take the first copy. A busy database is then an error.
                         (Closing them is only ever done on a local host, after you say yes.)
-  --yes                 Approve the plan, closing local sessions and a test command from ${CONFIG_FILE}
-                        without asking. Required when there is no terminal (CI). Only pass it
-                        for a run you have read the plan of.
+  --yes                 Approve the plan and a test command from ${CONFIG_FILE} without asking.
+                        Required when there is no terminal (CI). Only pass it for a run you have read the
+                        plan of. It does not approve closing sessions (see --close-sessions).
   --timeout <seconds>   Per test run. Default: 600
   --filter <text>       Only breaks whose id contains this text
   --checks-only         Run only the checks that need no tests
@@ -68,6 +77,10 @@ async function main(): Promise<number> {
       'only-related': { type: 'boolean' },
       isolation: { type: 'string' },
       'no-terminate': { type: 'boolean' },
+      'close-sessions': { type: 'boolean' },
+      'max-size': { type: 'string' },
+      'isolate-network': { type: 'boolean' },
+      'no-isolate-network': { type: 'boolean' },
       yes: { type: 'boolean' },
       'admin-url': { type: 'string' },
       timeout: { type: 'string' },
@@ -96,6 +109,25 @@ async function main(): Promise<number> {
   const file = readFileConfig(cwd);
   const found = discoverDbUrl(cwd, v['db-url']);
   knownUrl = [found.dbUrl, ...(v['admin-url'] ? [v['admin-url']] : [])];
+  // Values are checked before anything connects. A bad value is exit 2, never a silent default.
+  const threshold = v.threshold !== undefined ? parsePercent(v.threshold, '--threshold') : file.threshold !== undefined ? parsePercent(String(file.threshold), `"threshold" in ${CONFIG_FILE}`) : 100;
+  const jobs = v.jobs !== undefined ? parseJobs(v.jobs) : 2;
+  const timeoutSeconds = v.timeout !== undefined ? parseSeconds(v.timeout) : 600;
+  const runner = parseRunner(v.runner);
+  const maxSizeBytes = v['max-size'] !== undefined ? parseSize(v['max-size']) : DEFAULT_MAX_SIZE;
+  if (v['isolate-network'] && v['no-isolate-network']) throw new Error('--isolate-network and --no-isolate-network contradict each other.');
+  const urlProblem =
+    connectionParamProblem(found.dbUrl, v['db-url'] ? '--db-url' : 'the database URL') ??
+    (v['admin-url'] ? connectionParamProblem(v['admin-url'], '--admin-url') : null);
+  if (urlProblem) {
+    process.stderr.write(scrubSecrets(urlProblem, knownUrl) + '\n');
+    return 2;
+  }
+  const sourceName = sourceNameProblem(databaseOf(found.dbUrl));
+  if (sourceName) {
+    process.stderr.write(sourceName + '\n');
+    return 2;
+  }
   const allowRemote = Boolean(v[REMOTE_FLAG.slice(2)]);
   const refusal =
     remoteRefusal(found.dbUrl, allowRemote) ?? (v['admin-url'] ? remoteRefusal(v['admin-url'], allowRemote) : null);
@@ -108,6 +140,7 @@ async function main(): Promise<number> {
   found.dbUrl = resolveConnection(found.dbUrl).url;
   const adminUrl = v['admin-url'] ? resolveConnection(v['admin-url']).url : undefined;
   knownUrl.push(found.dbUrl, ...(adminUrl ? [adminUrl] : []));
+  const removedEnv = dbEnvRemovals(process.env);
   stripRedirectEnv();
 
   // Zero-config: a local Supabase has a documented superuser (supabase_admin, local default
@@ -141,9 +174,8 @@ async function main(): Promise<number> {
     );
     return 2;
   }
-  const runner = (v.runner ?? 'auto') as 'auto' | 'supabase' | 'psql';
-  const schemas = v.schemas ? v.schemas.split(',').map((s) => s.trim()).filter(Boolean) : (file.schemas?.length ? file.schemas : ['public']);
-  const suite = discoverSuite({ cwd, command: v.test ?? file.test, runner, testsDir: v['tests-dir'] });
+    const schemas = v.schemas ? v.schemas.split(',').map((s) => s.trim()).filter(Boolean) : (file.schemas?.length ? file.schemas : ['public']);
+  const suite = discoverSuite({ cwd, command: v.test ?? file.test, runner, testsDir: v['tests-dir'], verify: verifyDatabase });
   const tty = Boolean(process.stderr.isTTY);
 
   const out = v.json ? process.stderr : process.stdout;
@@ -152,15 +184,20 @@ async function main(): Promise<number> {
     databaseSource: found.source,
     schemas,
     suite,
-    jobs: v.jobs ? Number(v.jobs) : 2,
-    threshold: v.threshold ? Number(v.threshold) : (file.threshold ?? 100),
-    timeoutMs: (v.timeout ? Number(v.timeout) : 600) * 1000,
+    jobs,
+    threshold,
+    timeoutMs: timeoutSeconds * 1000,
     terminate: !v['no-terminate'],
+    closeSessions: Boolean(v['close-sessions']),
+    maxSizeBytes,
+    isolateNetwork: !v['no-isolate-network'],
     allowRemote,
     confirm: makePrompter({ yes: Boolean(v.yes) }),
     testFromConfig: !v.test && file.test ? file.test : undefined,
     adminUrl: adminUrlFinal,
     adminNote,
+    removedEnv,
+    envFiles: envFileWarnings(cwd),
     onlyRelated: Boolean(v['only-related']),
     checksOnly: Boolean(v['checks-only']),
     dryRun: Boolean(v['dry-run']),
@@ -175,7 +212,8 @@ async function main(): Promise<number> {
   const { model } = result;
   if (v['dry-run']) {
     out.write(`${result.breaks.length} breaks on ${model.policyCount} policies:\n`);
-    for (const b of result.breaks) out.write(`  ${b.id}\n      ${b.label}\n`);
+    for (const l of model.serverFacts ?? []) out.write(`  ${l}\n`);
+    for (const b of result.breaks) out.write(`  ${visible(b.id)}\n      ${visible(b.label)}\n`);
     return 0;
   }
   const urls = knownUrl;
@@ -190,7 +228,7 @@ main().then(
   (code) => process.exit(code),
   (e: Error) => {
     const text = e instanceof ApprovalRequired ? e.message : `rls-saboteur could not check: ${e.message}`;
-    process.stderr.write(scrubSecrets(text, knownUrl) + '\n');
+    process.stderr.write(scrubSecrets(text, knownUrl).split('\n').map(visible).join('\n') + '\n');
     process.exit(2);
   }
 );

@@ -2,16 +2,18 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from '
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { discoverSuite, passwordless } from '../src/tests.js';
+import { copyConnection, discoverSuite } from '../src/tests.js';
 
-describe('passwordless', () => {
-  it('moves the password out of the URL and into PGPASSWORD, decoded', () => {
-    const r = passwordless('postgres://u:p%40ss%24w@127.0.0.1:5432/db?sslmode=disable');
-    expect(r.url).toBe('postgres://u@127.0.0.1:5432/db?sslmode=disable');
+describe('copyConnection', () => {
+  it('moves the password out of the URL and into PGPASSWORD, decoded, and drops the query string', () => {
+    const r = copyConnection('postgres://u:p%40ss%24w@127.0.0.1:5432/db?sslmode=disable&dbname=other');
+    expect(r.url).toBe('postgres://u@127.0.0.1:5432/db');
     expect(r.env.PGPASSWORD).toBe('p@ss$w');
+    expect(r.env.PGDATABASE).toBe('db');
+    expect(r.env.PGSSLMODE).toBe('disable');
   });
   it('leaves a URL without a password alone', () => {
-    expect(passwordless('postgres://u@127.0.0.1/db').url).toBe('postgres://u@127.0.0.1/db');
+    expect(copyConnection('postgres://u@127.0.0.1/db').url).toBe('postgres://u@127.0.0.1/db');
   });
 });
 

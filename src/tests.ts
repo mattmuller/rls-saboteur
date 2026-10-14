@@ -1,6 +1,7 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs';
 import { join, relative } from 'node:path';
+import { safeParams } from './urls.js';
 
 /** passed: every test passed. failed: the tests ran and at least one assertion failed. error: the tests could not run. */
 export type TestStatus = 'passed' | 'failed' | 'error';
@@ -127,35 +128,81 @@ export function shellQuote(value: string, platform: NodeJS.Platform = process.pl
 }
 
 /**
- * Keep the password out of argv, where `ps` shows it to every user on the machine. The URL goes on the
- * command line without it, and the password travels in PGPASSWORD, which libpq (psql) and the Supabase CLI
- * (pgx) both read. A URL with no password is returned unchanged.
+ * Environment variables that can point a test at a database or a Supabase project. None may reach a test command.
+ * A name is removed when it contains (anywhere, any case) DATABASE, DB_URL, DBURL, DB_CONNECTION, DIRECT_URL, POSTGRES, SUPABASE or SERVICE_ROLE,
+ * or when it belongs to the PG* family that libpq reads (PGHOST, PGPASSWORD, PGSERVICE, ...).
  */
-export function passwordless(dbUrl: string): { url: string; env: NodeJS.ProcessEnv } {
-  try {
-    const u = new URL(dbUrl);
-    if (!u.password) return { url: dbUrl, env: process.env };
-    const password = decodeURIComponent(u.password);
-    u.password = '';
-    return { url: u.toString(), env: { ...process.env, PGPASSWORD: password } };
-  } catch {
-    return { url: dbUrl, env: process.env };
-  }
+const DB_ENV = /DATABASE|DB_URL|DBURL|DB_CONNECTION|DIRECT_URL|POSTGRES|SUPABASE|SERVICE_ROLE|^PG/i;
+
+/** The names (never the values) that would be removed from this environment before a test command runs. */
+export function dbEnvRemovals(base: NodeJS.ProcessEnv = process.env): string[] {
+  return Object.keys(base).filter((k) => DB_ENV.test(k)).sort();
 }
 
-/** Environment handed to every test command so it can reach the right database. */
-export function dbEnv(dbUrl: string): NodeJS.ProcessEnv {
+/** Files a test framework may load by itself, whatever environment we hand it. */
+const ENV_FILES = ['.env', '.env.local', '.env.test', '.env.test.local'];
+
+/**
+ * Names (only) of the .env files in `cwd` that mention a database or Supabase project. Test frameworks such as dotenv-based
+ * runners read these on their own, so they can reach a database other than the copy. We do not control them; the plan says so.
+ */
+export function envFileWarnings(cwd: string): string[] {
+  const out: string[] = [];
+  for (const f of ENV_FILES) {
+    try {
+      if (/DATABASE_URL|SUPABASE|POSTGRES/i.test(readFileSync(join(cwd, f), 'utf8'))) out.push(f);
+    } catch {
+      /* not there, or not readable */
+    }
+  }
+  return out;
+}
+
+const PARAM_TO_PGENV: Record<string, string> = {
+  sslmode: 'PGSSLMODE',
+  sslrootcert: 'PGSSLROOTCERT',
+  sslcert: 'PGSSLCERT',
+  sslkey: 'PGSSLKEY',
+  connect_timeout: 'PGCONNECT_TIMEOUT',
+  application_name: 'PGAPPNAME',
+  channel_binding: 'PGCHANNELBINDING',
+  gssencmode: 'PGGSSENCMODE'
+};
+
+/**
+ * Everything a subprocess needs to reach exactly one copy, and nothing else. The URL carries no query string
+ * and no password; the copy's host, port, database, user, password and ssl settings travel in PG* variables.
+ * Every other variable that could hold a database address is removed from the environment first.
+ * A libpq tool reads both the URL and PG*; here they agree, and no query parameter can disagree.
+ */
+export function copyConnection(dbUrl: string, base: NodeJS.ProcessEnv = process.env): { url: string; env: NodeJS.ProcessEnv } {
   const u = new URL(dbUrl);
-  return {
-    ...process.env,
-    DATABASE_URL: dbUrl,
-    SABOTEUR_DB_URL: dbUrl,
+  const env: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(base)) if (!DB_ENV.test(k)) env[k] = v;
+  const database = decodeURIComponent(u.pathname.slice(1));
+  Object.assign(env, {
     PGHOST: u.hostname.replace(/^\[|\]$/g, ''),
     PGPORT: u.port || '5432',
-    PGDATABASE: decodeURIComponent(u.pathname.slice(1)),
+    PGDATABASE: database,
     PGUSER: decodeURIComponent(u.username),
     PGPASSWORD: decodeURIComponent(u.password)
-  };
+  });
+  for (const [k, v] of safeParams(u)) {
+    const name = PARAM_TO_PGENV[k.toLowerCase()];
+    if (name) env[name] = v;
+  }
+  const clean = new URL(`${u.protocol}//placeholder`);
+  clean.username = u.username;
+  clean.hostname = u.hostname;
+  clean.port = u.port;
+  clean.pathname = u.pathname;
+  return { url: clean.toString(), env };
+}
+
+/** Environment handed to a custom test command so it can reach the copy, and only the copy. */
+export function dbEnv(dbUrl: string): NodeJS.ProcessEnv {
+  const { env } = copyConnection(dbUrl);
+  return { ...env, DATABASE_URL: dbUrl, SABOTEUR_DB_URL: dbUrl };
 }
 
 /** Count TAP result lines. Plain line-start checks on test output. */
@@ -214,9 +261,12 @@ export interface SuiteOptions {
   runner?: 'auto' | 'supabase' | 'psql';
   /** Directory of pgTAP files. Default supabase/tests. */
   testsDir?: string;
+  /** Called with the copy's URL before every subprocess starts. Throws when the URL does not reach that copy. */
+  verify?: (dbUrl: string) => Promise<void>;
 }
 
 export function discoverSuite(o: SuiteOptions): TestSuite | null {
+  const verify = o.verify ?? (async () => {});
   if (o.command) {
     const cmd = o.command;
     return {
@@ -240,6 +290,7 @@ export function discoverSuite(o: SuiteOptions): TestSuite | null {
           }
           withUrl = cmd.split('{{db_url}}').join(quoted);
         }
+        await verify(dbUrl);
         const r = await execute(withUrl, [], dbEnv(dbUrl), o.cwd, opts.timeoutMs, true);
         return { ...classifyCustom(r), output: r.output, timedOut: r.timedOut };
       }
@@ -260,8 +311,9 @@ export function discoverSuite(o: SuiteOptions): TestSuite | null {
       contents,
       async run(dbUrl, opts) {
         // A custom directory is passed explicitly; the CLI only looks in supabase/tests by itself.
-        const safe = passwordless(dbUrl);
+        const safe = copyConnection(dbUrl);
         const args = ['test', 'db', '--db-url', safe.url, ...(opts.files ?? (testsDir === TESTS_DIR ? [] : [testsDir]))];
+        await verify(dbUrl);
         const r = await execute('supabase', args, safe.env, o.cwd, opts.timeoutMs, false);
         const m = /Tests=(\d+)/.exec(r.output);
         return {
@@ -284,15 +336,17 @@ export function discoverSuite(o: SuiteOptions): TestSuite | null {
         "do $$ begin if exists (select 1 from pg_namespace where nspname = 'extensions') " +
         "then create extension if not exists pgtap with schema extensions; " +
         "else create extension if not exists pgtap; end if; end $$;";
-      const safe = passwordless(dbUrl);
+      const safe = copyConnection(dbUrl);
+      await verify(dbUrl);
       const r = await execute('psql', ['-X', '-q', '-v', 'ON_ERROR_STOP=1', '-c', sql, safe.url], safe.env, o.cwd, 60_000, false);
       if (r.code !== 0) throw new Error(`Could not install pgTAP for the psql runner:\n${r.output.trim()}`);
     },
     async run(dbUrl, opts) {
       const list = opts.files ?? files;
-      const safe = passwordless(dbUrl);
+      const safe = copyConnection(dbUrl);
       let all = '';
       for (const f of list) {
+        await verify(dbUrl);
         const r = await execute(
           'psql',
           ['-X', '-q', '-A', '-t', '-v', 'ON_ERROR_STOP=1', '-f', f, safe.url],

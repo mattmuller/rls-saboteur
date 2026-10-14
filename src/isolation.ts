@@ -1,6 +1,9 @@
 import { urlIsLocal } from './safety.js';
 import { withDatabase } from './config.js';
-import { Guard, PREFIX, LABEL_PREFIX, TERMINATE_SQL, copyOwnerPid, databaseOf, type Db } from './guard.js';
+import { CANCEL_SQL, Guard, TERMINATE_SQL, copyOwnerPid, databaseOf, droppable, sourceNameProblem, type Db } from './guard.js';
+import { readIdentity, sameServer } from './facts.js';
+import { isolateNetwork } from './network.js';
+import { hostOf } from './safety.js';
 import { qi } from './sql.js';
 import type { Break } from './types.js';
 
@@ -34,19 +37,18 @@ function sqlstate(e: unknown): string | undefined {
 }
 
 /**
- * Drop copies left behind by earlier runs that died. A database is dropped only when its name matches
- * saboteur_<pid>_..., its comment starts with "rls-saboteur copy " and its pid is dead.
+ * Drop copies left behind by earlier runs that died. A database is dropped only when droppable() says so: its NAME
+ * (saboteur_<host>_<pid>_<token>_...) or its label names this host, its pid is dead here, and it is not the source.
+ * The admin connection's guard repeats that rule inside the connection before it sends the drop.
  */
-export async function sweepStale(admin: Db): Promise<number> {
+export async function sweepStale(admin: Db, sourceDb = '', token = ''): Promise<number> {
   const res = await admin.query(
     `select datname, shobj_description(oid, 'pg_database') as label from pg_database where datname like 'saboteur\\_%'`
   );
   let dropped = 0;
   for (const { datname, label } of res.rows as { datname: string; label: string | null }[]) {
-    if (copyOwnerPid(datname) === null) continue;
-    if (!label || !label.startsWith(LABEL_PREFIX)) continue;
+    if (!droppable(datname, label, sourceDb, token).ok) continue;
     try {
-      // The guard repeats the label and pid checks inside the connection before it sends the drop.
       await admin.query(`drop database if exists ${qi(datname)} with (force)`);
       dropped++;
     } catch {
@@ -69,6 +71,10 @@ export interface IsolationOptions {
   adminUrl?: string;
   /** Asked before any session on the source is closed. Return false to stop. */
   confirmTerminate?: (n: number, applications: string[], db: string) => Promise<boolean>;
+  /** Switch off outbound HTTP inside the copies (default true). The source is never touched. */
+  isolateNetwork?: boolean;
+  /** How long cleanup waits for an interrupted CREATE DATABASE to end (default 30 s). */
+  cleanupWaitMs?: number;
   /** Runs once on the master template, e.g. installing pgTAP. */
   prepareMaster?: (masterUrl: string) => Promise<void>;
 }
@@ -80,13 +86,88 @@ export async function createIsolation(o: IsolationOptions): Promise<Isolation> {
   const owner = decodeURIComponent(new URL(o.sourceUrl).username);
   const notes: string[] = [];
   const local = urlIsLocal(o.sourceUrl) && (!o.adminUrl || urlIsLocal(o.adminUrl));
+  const sourceProblem = sourceNameProblem(sourceDb);
+  if (sourceProblem) throw new Error(sourceProblem);
   const guard = new Guard({ sourceUrl: o.sourceUrl, allowTerminate: o.terminate && !o.allowRemote && local });
+  const master = guard.masterName();
+  const WAIT_MS = o.cleanupWaitMs ?? 30_000;
 
-  const admin = await guard.connect(adminUrl);
-  const master = `${PREFIX}${process.pid}_tpl`;
-  let result: Isolation | null = null;
+  /**
+   * Cleanup comes first: a Ctrl-C during the very first copy must still remove what exists so far.
+   * A CREATE DATABASE that is still running on the server will finish by itself after the client is gone, and the copy
+   * would be left behind. So: stop starting copies, cancel our own CREATEs, wait for them to end, then drop by name.
+   * Returns the names that are still there.
+   */
+  const cleanup = async (): Promise<string[]> => {
+    guard.stopCreating();
+    let a: Db | undefined;
+    try {
+      a = await guard.connect(adminUrl);
+      for (const c of guard.inflightCreates()) {
+        // pg_cancel_backend on the backend running our own CREATE; the guard allows no other pid.
+        await a.query(CANCEL_SQL, [c.pid]).catch(() => {});
+      }
+      await guard.waitCreatesEnded(WAIT_MS);
+      for (const n of new Set([...guard.attempted, master])) await guard.dropCopy(a, n).catch(() => {});
+      const left = await a.query(`select datname from pg_database where datname = any($1::text[])`, [[...guard.attempted, master]]);
+      const names = (left.rows as { datname: string }[]).map((r) => r.datname);
+      // A CREATE that did not end in time may still produce its database later: name it too.
+      for (const c of guard.inflightCreates()) if (!names.includes(c.name)) names.push(c.name);
+      return names;
+    } catch {
+      return [...new Set([...guard.attempted, master])];
+    } finally {
+      await a?.end().catch(() => {});
+    }
+  };
+  const leftoverMessage = (names: string[]): string =>
+    `rls-saboteur could not remove its temporary copies: ${names.join(', ')}. ` +
+    `Drop them yourself: ${names.map((n) => `drop database ${qi(n)} with (force);`).join(' ')}`;
+  let signalled = false;
+  // When a signal is being handled, the signal handler owns the exit. The normal paths wait for it instead of racing it.
+  const yieldToSignal = async (): Promise<void> => {
+    if (signalled) await new Promise<never>(() => {});
+  };
+  const onSignal = (sig: NodeJS.Signals): void => {
+    if (signalled) return;
+    signalled = true;
+    const code = sig === 'SIGINT' ? 130 : 143;
+    // The whole cleanup is bounded, so a dead server cannot hold the exit forever.
+    const limit = new Promise<string[] | 'timeout'>((r) => setTimeout(() => r('timeout'), WAIT_MS * 2 + 5000).unref());
+    Promise.race([cleanup(), limit])
+      .then((left) => {
+        const names = left === 'timeout' ? [...new Set([...guard.attempted, master])] : left;
+        if (names.length) {
+          process.stderr.write(leftoverMessage(names) + '\n');
+          process.exit(1);
+          return;
+        }
+        process.exit(code);
+      })
+      .catch(() => process.exit(1));
+  };
+  const uninstall = (): void => {
+    process.off('SIGINT', onSignal);
+    process.off('SIGTERM', onSignal);
+  };
+  process.on('SIGINT', onSignal);
+  process.on('SIGTERM', onSignal);
+
+  let admin: Db | undefined;
+  let ready = false;
   try {
-    await sweepStale(admin);
+    admin = await guard.connect(adminUrl);
+    if (o.adminUrl) {
+      const r = await assertSameServer(guard, o.sourceUrl, o.adminUrl);
+      // Closing sessions on the source is only allowed when it is PROVEN that the admin connection is on the same server.
+      if (!r.proven) {
+        guard.denyTerminate(
+          `closing other sessions is refused: the admin URL could be shown to be on the same server only by host and port (${r.how}), which does not prove it. ` +
+            `Use a superuser --admin-url, or stop the services that use the database yourself`
+        );
+      }
+    }
+    await sweepStale(admin, guard.sourceDb, guard.token);
     const created = await makeMaster(guard, admin, master, owner, o, notes);
     if (!created.ok) {
       throw new Error(
@@ -96,65 +177,93 @@ export async function createIsolation(o: IsolationOptions): Promise<Isolation> {
       );
     }
     const masterUrl = withDatabase(o.sourceUrl, master);
-    try {
-      if (o.prepareMaster) await o.prepareMaster(masterUrl);
-    } catch (e) {
-      await guard.dropCopy(admin, master).catch(() => {});
-      throw e;
+    if (o.isolateNetwork !== false) {
+      const m = await guard.connect(withDatabase(o.adminUrl ?? o.sourceUrl, master));
+      try {
+        const r = await isolateNetwork(m);
+        notes.push(
+          r.replaced.length
+            ? `Outbound HTTP is switched off in the copies: ${r.replaced.length} function(s) (${r.replaced.slice(0, 6).join(', ')}${r.replaced.length > 6 ? ', ...' : ''}) do nothing there.`
+            : 'Outbound HTTP is switched off in the copies: no pg_net or http functions were found.'
+        );
+        if (r.remaining.length) {
+          notes.push(`Not switched off: ${r.remaining.join(', ')} can still open connections from a copy.`);
+        }
+      } finally {
+        await m.end().catch(() => {});
+      }
     }
+    if (o.prepareMaster) await o.prepareMaster(masterUrl);
 
     let counter = 0;
-    const live = new Set<string>();
     const withCopy = async <T>(brk: Break | null, fn: (dbUrl: string) => Promise<T>): Promise<T> => {
-      const name = `${PREFIX}${process.pid}_${++counter}`;
+      const name = guard.copyName(++counter);
       const a = await guard.connect(adminUrl);
-      live.add(name);
       try {
         await guard.createCopy(a, name, master, owner);
         const url = withDatabase(o.sourceUrl, name);
-        if (brk) {
-          const c = await guard.connect(url);
-          try {
-            for (const stmt of brk.apply) await c.query(stmt);
-          } finally {
-            await c.end().catch(() => {});
-          }
+        // Connecting checks current_database() against the name. Done for the unbroken copy too.
+        const c = await guard.connect(url);
+        try {
+          if (brk) for (const stmt of brk.apply) await c.query(stmt);
+        } finally {
+          await c.end().catch(() => {});
         }
         return await fn(url);
       } finally {
         await guard.dropCopy(a, name).catch(() => {});
-        live.delete(name);
         await a.end().catch(() => {});
       }
     };
 
-    const onSignal = (sig: NodeJS.Signals): void => {
-      result?.dispose().finally(() => process.exit(sig === 'SIGINT' ? 130 : 143));
-    };
-    process.on('SIGINT', onSignal);
-    process.on('SIGTERM', onSignal);
-
-    result = {
+    ready = true;
+    return {
       mode: 'template',
       notes,
       withBreak: (brk, fn) => withCopy(brk, fn),
       withPristine: (fn) => withCopy(null, fn),
       async dispose() {
-        process.off('SIGINT', onSignal);
-        process.off('SIGTERM', onSignal);
-        const a = await guard.connect(adminUrl);
-        try {
-          for (const n of live) await guard.dropCopy(a, n).catch(() => {});
-          await guard.dropCopy(a, master).catch(() => {});
-        } finally {
-          await a.end().catch(() => {});
-        }
+        await yieldToSignal();
+        uninstall();
+        const left = await cleanup();
+        if (left.length) throw new Error(leftoverMessage(left));
       }
     };
-    return result;
+  } catch (e) {
+    await yieldToSignal();
+    const left = await cleanup().catch(() => [] as string[]);
+    if (left.length) (e as Error).message += `\n${leftoverMessage(left)}`;
+    throw e;
   } finally {
-    await admin.end().catch(() => {});
+    if (!ready) uninstall();
+    await admin?.end().catch(() => {});
   }
+}
+
+/** --admin-url may only copy and drop on the server that holds the source. Anything else exits 2. */
+async function assertSameServer(guard: Guard, sourceUrl: string, adminUrl: string): Promise<{ proven: boolean; how: string }> {
+  const src = await guard.connect(sourceUrl);
+  const adm = await guard.connect(adminUrl);
+  try {
+    const a = await readIdentity(src);
+    const b = await readIdentity(adm);
+    const r = sameServer(a, b, hostPort(sourceUrl), hostPort(adminUrl));
+    if (!r.same) {
+      throw new Error(
+        `--admin-url is not the same server as --db-url (compared: ${r.how}). ` +
+          `The admin connection copies and drops databases, so it must be the server that holds the source. Nothing was copied`
+      );
+    }
+    return { proven: r.proven, how: r.how };
+  } finally {
+    await src.end().catch(() => {});
+    await adm.end().catch(() => {});
+  }
+}
+
+function hostPort(url: string): string {
+  const u = new URL(url);
+  return `${hostOf(url)}:${u.port || '5432'}`;
 }
 
 async function makeMaster(
@@ -182,7 +291,9 @@ async function makeMaster(
   const n = others.rows[0].n as number;
   const apps = ((others.rows[0].apps as (string | null)[]) ?? []).filter((a): a is string => Boolean(a)).sort();
   if (!guard.allowTerminate) {
-    const why = o.allowRemote
+    const why = guard.terminateDeniedReason
+      ? guard.terminateDeniedReason
+      : o.allowRemote
       ? 'closing other connections is never done together with the remote flag'
       : !o.terminate
         ? '--no-terminate was given'

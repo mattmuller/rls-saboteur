@@ -32,6 +32,13 @@ inputs:
       Version of the rls-saboteur npm package to run. The default is the version this
       release of the action ships with. The release step must keep it equal to package.json.
     default: '0.2.0'
+  close-sessions:
+    description: >
+      Approve closing other sessions on the CI database for a moment, to take the first copy
+      (passes --close-sessions). Empty (the default) means true when start-supabase is true, because
+      the Action then starts its own throwaway database stack and nothing else uses it, and false
+      otherwise, because the database is then yours. Set true or false to override. --yes does not approve this.
+    default: ''
   extra-args:
     description: Extra command-line options for rls-saboteur.
     default: ''
@@ -47,6 +54,27 @@ outputs:
 runs:
   using: composite
   steps:
+    - name: Check inputs
+      id: check
+      shell: bash
+      env:
+        SABOTEUR_START: ${{ inputs.start-supabase }}
+        SABOTEUR_THRESHOLD: ${{ inputs.threshold }}
+        SABOTEUR_JOBS: ${{ inputs.jobs }}
+        SABOTEUR_VERSION: ${{ inputs.version }}
+        SABOTEUR_CLOSE: ${{ inputs.close-sessions }}
+      run: |
+        fail() { echo "::error::$1"; exit 2; }
+        [[ "$SABOTEUR_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "version must look like 0.2.0, got: $SABOTEUR_VERSION"
+        [[ "$SABOTEUR_THRESHOLD" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v t="$SABOTEUR_THRESHOLD" 'BEGIN { exit !(t >= 0 && t <= 100) }' || fail "threshold must be a number from 0 to 100, got: $SABOTEUR_THRESHOLD"
+        [[ "$SABOTEUR_JOBS" =~ ^[1-9][0-9]*$ ]] || fail "jobs must be a whole number of 1 or more, got: $SABOTEUR_JOBS"
+        [[ "$SABOTEUR_CLOSE" == "" || "$SABOTEUR_CLOSE" == "true" || "$SABOTEUR_CLOSE" == "false" ]] || fail "close-sessions must be true or false, got: $SABOTEUR_CLOSE"
+        # Unset: close sessions only on the throwaway stack this Action starts itself.
+        if [ -z "$SABOTEUR_CLOSE" ]; then
+          if [ "$SABOTEUR_START" = "true" ]; then SABOTEUR_CLOSE=true; else SABOTEUR_CLOSE=false; fi
+        fi
+        echo "close=$SABOTEUR_CLOSE" >> "$GITHUB_OUTPUT"
+
     - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
       with:
         node-version: '22'
@@ -73,10 +101,13 @@ runs:
         SABOTEUR_SCHEMAS: ${{ inputs.schemas }}
         SABOTEUR_JOBS: ${{ inputs.jobs }}
         SABOTEUR_VERSION: ${{ inputs.version }}
+        SABOTEUR_CLOSE: ${{ steps.check.outputs.close }}
         SABOTEUR_EXTRA: ${{ inputs.extra-args }}
       run: |
         # --yes: a CI run has no terminal. The workflow file is the user's own approval of the plan.
+        # Closing sessions is a separate approval (--yes does not give it): the close-sessions input.
         args=(--threshold "$SABOTEUR_THRESHOLD" --schemas "$SABOTEUR_SCHEMAS" --jobs "$SABOTEUR_JOBS" --json-file saboteur-report.json --yes)
+        if [ "$SABOTEUR_CLOSE" = "true" ]; then args+=(--close-sessions); fi
         if [ -n "$SABOTEUR_TEST" ]; then args+=(--test "$SABOTEUR_TEST"); fi
         read -r -a extra <<< "$SABOTEUR_EXTRA"
         set +e
