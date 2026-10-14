@@ -1,0 +1,45 @@
+name: Bug report
+description: Report a wrong result, a crash, a wrong exit code, or a copy that was left behind.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report security problems here. Use the [private advisory page](https://github.com/mattmuller/rls-saboteur/security/advisories/new).
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Run `npx rls-saboteur --version`.
+    validations:
+      required: true
+  - type: input
+    id: postgres
+    attributes:
+      label: PostgreSQL version and where it runs
+      description: For example "17.6, local Supabase" or "16, Docker".
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command
+      description: The exact command you ran. Hide passwords.
+      render: sh
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected
+      description: What you expected to happen.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual
+      description: What happened. Include the exit code and the output. Remove anything private before you paste.
+      render: text
+    validations:
+      required: true

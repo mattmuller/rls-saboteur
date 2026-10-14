@@ -7,7 +7,7 @@ import { withDatabase } from './config.js';
 import { qi } from './sql.js';
 
 /**
- * The structural guard. Every pg connection in this tool is opened by Guard.connect, and every
+ * The guard. Every pg connection in this tool is opened by Guard.connect, and every
  * statement goes through the allowlist below BEFORE it is sent. There are three kinds of connection:
  *
  *  - copy:   a database this run created and labelled. Anything goes. It is thrown away.
