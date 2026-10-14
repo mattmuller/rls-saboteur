@@ -112,6 +112,37 @@ function execute(
   });
 }
 
+/**
+ * Quote a value so the shell that `spawn(..., {shell: true})` uses passes it on byte for byte.
+ * POSIX sh: single quotes, with each ' written as '\''. Windows cmd.exe: double quotes, and a value
+ * holding " % or ! is refused, because cmd.exe expands or breaks on those even inside quotes.
+ * Returns null when the value cannot be quoted safely.
+ */
+export function shellQuote(value: string, platform: NodeJS.Platform = process.platform): string | null {
+  if (platform === 'win32') {
+    if (/["%!]/.test(value)) return null;
+    return `"${value}"`;
+  }
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Keep the password out of argv, where `ps` shows it to every user on the machine. The URL goes on the
+ * command line without it, and the password travels in PGPASSWORD, which libpq (psql) and the Supabase CLI
+ * (pgx) both read. A URL with no password is returned unchanged.
+ */
+export function passwordless(dbUrl: string): { url: string; env: NodeJS.ProcessEnv } {
+  try {
+    const u = new URL(dbUrl);
+    if (!u.password) return { url: dbUrl, env: process.env };
+    const password = decodeURIComponent(u.password);
+    u.password = '';
+    return { url: u.toString(), env: { ...process.env, PGPASSWORD: password } };
+  } catch {
+    return { url: dbUrl, env: process.env };
+  }
+}
+
 /** Environment handed to every test command so it can reach the right database. */
 export function dbEnv(dbUrl: string): NodeJS.ProcessEnv {
   const u = new URL(dbUrl);
@@ -194,7 +225,21 @@ export function discoverSuite(o: SuiteOptions): TestSuite | null {
       files: [],
       contents: new Map(),
       async run(dbUrl, opts) {
-        const withUrl = cmd.split('{{db_url}}').join(JSON.stringify(dbUrl));
+        let withUrl = cmd;
+        if (cmd.includes('{{db_url}}')) {
+          const quoted = shellQuote(dbUrl);
+          if (quoted === null) {
+            return {
+              status: 'error',
+              reason:
+                'the database URL holds a character (" % or !) that cmd.exe cannot pass safely through {{db_url}}. ' +
+                'Use $DATABASE_URL (%DATABASE_URL% in cmd.exe) in your command instead.',
+              output: '',
+              timedOut: false
+            };
+          }
+          withUrl = cmd.split('{{db_url}}').join(quoted);
+        }
         const r = await execute(withUrl, [], dbEnv(dbUrl), o.cwd, opts.timeoutMs, true);
         return { ...classifyCustom(r), output: r.output, timedOut: r.timedOut };
       }
@@ -215,8 +260,9 @@ export function discoverSuite(o: SuiteOptions): TestSuite | null {
       contents,
       async run(dbUrl, opts) {
         // A custom directory is passed explicitly; the CLI only looks in supabase/tests by itself.
-        const args = ['test', 'db', '--db-url', dbUrl, ...(opts.files ?? (testsDir === TESTS_DIR ? [] : [testsDir]))];
-        const r = await execute('supabase', args, process.env, o.cwd, opts.timeoutMs, false);
+        const safe = passwordless(dbUrl);
+        const args = ['test', 'db', '--db-url', safe.url, ...(opts.files ?? (testsDir === TESTS_DIR ? [] : [testsDir]))];
+        const r = await execute('supabase', args, safe.env, o.cwd, opts.timeoutMs, false);
         const m = /Tests=(\d+)/.exec(r.output);
         return {
           ...classifyTap(r),
@@ -238,17 +284,19 @@ export function discoverSuite(o: SuiteOptions): TestSuite | null {
         "do $$ begin if exists (select 1 from pg_namespace where nspname = 'extensions') " +
         "then create extension if not exists pgtap with schema extensions; " +
         "else create extension if not exists pgtap; end if; end $$;";
-      const r = await execute('psql', ['-X', '-q', '-v', 'ON_ERROR_STOP=1', '-c', sql, dbUrl], process.env, o.cwd, 60_000, false);
+      const safe = passwordless(dbUrl);
+      const r = await execute('psql', ['-X', '-q', '-v', 'ON_ERROR_STOP=1', '-c', sql, safe.url], safe.env, o.cwd, 60_000, false);
       if (r.code !== 0) throw new Error(`Could not install pgTAP for the psql runner:\n${r.output.trim()}`);
     },
     async run(dbUrl, opts) {
       const list = opts.files ?? files;
+      const safe = passwordless(dbUrl);
       let all = '';
       for (const f of list) {
         const r = await execute(
           'psql',
-          ['-X', '-q', '-A', '-t', '-v', 'ON_ERROR_STOP=1', '-f', f, dbUrl],
-          process.env,
+          ['-X', '-q', '-A', '-t', '-v', 'ON_ERROR_STOP=1', '-f', f, safe.url],
+          safe.env,
           o.cwd,
           opts.timeoutMs,
           false

@@ -31,7 +31,7 @@ inputs:
     description: >
       Version of the rls-saboteur npm package to run. The default is the version this
       release of the action ships with. The release step must keep it equal to package.json.
-    default: '0.1.0'
+    default: '0.1.1'
   extra-args:
     description: Extra command-line options for rls-saboteur.
     default: ''
@@ -47,11 +47,11 @@ outputs:
 runs:
   using: composite
   steps:
-    - uses: actions/setup-node@v4
+    - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
       with:
         node-version: '22'
 
-    - uses: supabase/setup-cli@v1
+    - uses: supabase/setup-cli@1dedf2c611547ede7232d26866dd3c56ab903bbb # v1.7.3
       with:
         version: '2.117.0'
 
@@ -91,7 +91,7 @@ runs:
 
     - name: Upload report
       if: ${{ always() }}
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
         name: rls-saboteur-report
         path: |

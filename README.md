@@ -108,7 +108,7 @@ Score  100%   exit 0 (threshold 100%)
 
 - Default runner: `supabase test db --db-url <copy url>`. The Supabase CLI takes a connection string, so it runs the same pgTAP suite against the copy.
 - No Supabase CLI: `--runner psql` runs each `.sql` file with psql against the copy. It installs pgTAP in the copy. A file fails on a `not ok` line, a `# Looks like you failed` line, or a plan mismatch. Exit 3 (a SQL statement failed under `ON_ERROR_STOP`) also counts as a failure, because the unbroken baseline ran the same files and passed. Any other non-zero exit (1 fatal, 2 connection lost) or a signal is an error. The Supabase runner needs TAP evidence for a failure.
-- Any other command: `--test "pnpm test:rls"`. The copy is passed as `$DATABASE_URL`, `$SABOTEUR_DB_URL`, the `PG*` variables, and as `{{db_url}}` inside the command string. The command must follow the exit code contract below.
+- Any other command: `--test "pnpm test:rls"`. The copy is passed as `$DATABASE_URL`, `$SABOTEUR_DB_URL` and the `PG*` variables. Use `$DATABASE_URL` in your command. `{{db_url}}` is also replaced inside the command string, shell-quoted so the URL arrives unchanged (single quotes on macOS and Linux, double quotes on Windows). On Windows a URL holding `"`, `%` or `!` is refused, so use `%DATABASE_URL%` there. The command must follow the exit code contract below.
 
 **Exit code contract for `--test`.** Exit `0` means every test passed. Exit `1` means a test failed. Any other exit code, or a kill by a signal, means the tests could not run. This is the pytest convention. A break counts as caught only on exit `1`. Your command must exit `1`, and only `1`, when an assertion fails. If it exits `2` for "could not parse a result", the break is an error.
 
@@ -121,6 +121,14 @@ RLS Saboteur handles this once, at the start. It closes the other connections fo
 A stock local Supabase stack has one more catch. The cron scheduler keeps a connection open as a superuser, and the normal `postgres` role cannot close it. So when the host is local and `supabase/config.toml` exists, RLS Saboteur tries the CLI's documented local superuser (`supabase_admin`, local default password) on the same host and port. It uses that role only to copy and drop databases, and prints one line saying so. If that login fails, pass your own with `--admin-url <superuser url>`.
 
 If no copy can be made, it stops with exit 2 and names both fixes. It never falls back to **in-place mode** by itself. In-place mode applies each break to your own database and puts the policy back afterwards. A crash or `kill -9` mid-run would leave a policy broken, so you must ask for it with `--isolation in-place`, and only on a throwaway local database. It restores on Ctrl-C.
+
+### Security notes
+
+- **`--test` and the `test` value in `.rls-saboteur.json` run as shell commands**, the same way `package.json` scripts do. Run the tool only in projects you trust, and never with a config file you did not read.
+- **In CI, never pass untrusted text to the Action's `extra-args` input.** It becomes command-line options. Pull request titles, branch names and comment bodies are untrusted. The same goes for the `test` input.
+- **Give the workflow the least permission.** Set `permissions: contents: read` on any workflow that uses the Action.
+- **In-place mode cannot restore after a hard kill** (`SIGKILL`, a crash or a power loss). A policy can stay broken. Use `--isolation in-place` only on a throwaway local database.
+- Passwords are passed to `psql` and the Supabase CLI in `PGPASSWORD`, not on the command line.
 
 On the demo project, 42 breaks took about 35 seconds on copies with `--jobs 2`, and about 90 seconds in place.
 

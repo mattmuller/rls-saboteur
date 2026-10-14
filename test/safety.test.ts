@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { remoteRefusal, resolveConnection, urlIsLocal } from '../src/safety.js';
+import { isLocalHost, remoteRefusal, resolveConnection, urlIsLocal } from '../src/safety.js';
 import { scrubSecrets } from '../src/config.js';
 
 const none: NodeJS.ProcessEnv = {};
@@ -46,5 +46,16 @@ describe('the scrubber uses the same resolver', () => {
     const url = 'postgres://postgres:postgres@localhost/db?host=prod.example.com';
     expect(urlIsLocal(url, none)).toBe(false);
     expect(scrubSecrets('rejected: postgres', [url])).not.toContain('postgres');
+  });
+});
+
+describe('a Supabase container name is local, a dotted look-alike is not', () => {
+  it('accepts a single-label container name', () => {
+    expect(isLocalHost('supabase_db_my-project')).toBe(true);
+    expect(urlIsLocal('postgres://u:p@supabase_db_my-project:5432/db', none)).toBe(true);
+  });
+  it('refuses a dotted name that only starts with the prefix', () => {
+    expect(isLocalHost('supabase_db_x.evil.com')).toBe(false);
+    expect(remoteRefusal('postgres://u:p@supabase_db_x.evil.com:5432/db', false, none)).toContain('supabase_db_x.evil.com');
   });
 });

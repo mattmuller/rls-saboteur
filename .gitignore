@@ -3,3 +3,4 @@ dist
 saboteur-report.*
 .DS_Store
 e2e-report.md
+examples/demo/supabase/.temp/

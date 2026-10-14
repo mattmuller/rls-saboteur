@@ -19,7 +19,8 @@ export function isLocalHost(host: string | undefined | null): boolean {
   if (h.startsWith('/')) return true;
   if (LOCAL_HOSTS.has(h)) return true;
   if (h.endsWith('.localhost')) return true;
-  if (h.startsWith('supabase_db_')) return true;
+  // A Supabase container name is one DNS label. A dotted name such as supabase_db_x.evil.com is a real host.
+  if (/^supabase_db_[a-z0-9_-]+$/.test(h)) return true;
   return false;
 }
 
