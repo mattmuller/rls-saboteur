@@ -6,6 +6,11 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- The GitHub Action now uses `supabase/setup-cli` v3.0.1 (installs the Supabase CLI from npm) and `actions/upload-artifact` v7.0.2. Its inputs and the report artifact are unchanged.
+- Development: TypeScript 7 and `actions/setup-node` v7.1.0.
+
 ## [0.2.0] - 2026-10-14
 
 The tool can now change only its own temporary copies. Every item below says what was wrong before.
