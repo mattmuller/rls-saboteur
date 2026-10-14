@@ -12,8 +12,18 @@ Check that a local Supabase is running (`supabase status`). If it is not, tell t
 
 Run this from the project root. Add any options the user passed: $ARGUMENTS
 
+**Get the user's approval first. Never approve on their behalf.** The tool asks "Continue? (y/N)" before it copies anything, but it cannot ask you: there is no terminal in this session, so it needs `--yes`, and `--yes` answers yes to every question. The reason for this rule: an agent that adds `--yes` by itself has approved, in the user's name, a plan the user never saw. So:
+
+1. Run a dry run, which asks nothing and changes nothing: `npx rls-saboteur --dry-run $ARGUMENTS`.
+2. Show the user, in the chat, this plan: the database (name and host, from the output of the dry run and `supabase status`), the number of policies it will break, the test command, and the line "It will not change this database. It works on temporary copies."
+3. If `.rls-saboteur.json` has a `test` command, show the exact command too. It runs as the user.
+4. If the database has other connections open (a running Supabase stack always does), say that the tool will close them for a moment to take the first copy, and that they reconnect by themselves.
+5. Ask "Continue?" and wait for an explicit yes in the chat. Silence, a vague answer or an earlier yes for a different plan is not a yes. If the answer is no, stop.
+
+Only after the yes, run with `--yes`:
+
 ```
-npx rls-saboteur --json-file saboteur-report.json
+npx rls-saboteur --yes --json-file saboteur-report.json
 ```
 
 Print the console report exactly as the tool wrote it. Do not summarise it away.

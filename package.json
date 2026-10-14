@@ -1,6 +1,6 @@
 {
   "name": "rls-saboteur",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Mutation testing for Postgres and Supabase Row Level Security. Breaks each policy on purpose and lists every break your tests missed.",
   "type": "module",
   "license": "MIT",

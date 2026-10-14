@@ -151,7 +151,6 @@ describe('generateBreaks', () => {
     )!;
     expect(b.apply[0]).toMatch(/^drop policy/);
     expect(b.apply[1]).toContain('as permissive for select to "authenticated" using ((archived = false))');
-    expect(b.restore[1]).toContain('as restrictive');
   });
 
   it('adds one RLS-disabled break per table that has policies', () => {
@@ -163,13 +162,5 @@ describe('generateBreaks', () => {
     const r = generateBreaks(cat([policy({ qual: 'this is ((( not sql' })]));
     expect(r.unparsed).toHaveLength(1);
     expect(r.breaks.map((b) => b.kind)).toContain('drop-policy');
-  });
-
-  it('every break carries a restore', () => {
-    const c = cat([
-      policy({ qual: '(author_id = auth.uid())' }),
-      policy({ name: 'r', cmd: 'UPDATE', qual: '(a = 1) AND (b = 2)', withCheck: '(a = 1) AND (b = 2)' })
-    ]);
-    for (const b of generateBreaks(c).breaks) expect(b.restore.length).toBeGreaterThan(0);
   });
 });

@@ -55,8 +55,6 @@ export interface Break {
   effect: string;
   /** DDL that applies the break. */
   apply: string[];
-  /** DDL that puts the original back (used by the in-place fallback). */
-  restore: string[];
 }
 
 export type Outcome = 'caught' | 'missed' | 'skipped' | 'error';

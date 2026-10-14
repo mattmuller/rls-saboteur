@@ -1,4 +1,4 @@
-import type pg from 'pg';
+import type { Db } from './guard.js';
 import type { Finding } from './types.js';
 
 /**
@@ -33,7 +33,7 @@ const CLIENT_ROLES = ['anon', 'authenticated'];
  * table fails with "permission denied for function". pg_depend records which
  * functions a policy names; neither grep nor pg_get_functiondef can see that.
  */
-export async function checkFunctionExecute(client: pg.Client, schemas: string[]): Promise<Finding[]> {
+export async function checkFunctionExecute(client: Db, schemas: string[]): Promise<Finding[]> {
   const res = await client.query(
     `with deps as (
        select distinct p.oid as pol, n.nspname as tschema, c.relname as tname, p.polname,
@@ -77,7 +77,7 @@ export async function checkFunctionExecute(client: pg.Client, schemas: string[])
  * A role that inherits from anon gets every grant and policy anon has. Any
  * restriction placed on the custom role then stops meaning anything.
  */
-export async function checkRoleMembership(client: pg.Client): Promise<Finding[]> {
+export async function checkRoleMembership(client: Db): Promise<Finding[]> {
   const res = await client.query(
     `select m.rolname::text as member, g.rolname::text as granted
        from pg_auth_members am
@@ -112,7 +112,7 @@ export async function checkRoleMembership(client: pg.Client): Promise<Finding[]>
  * table and also has column-level entries for the same privilege: someone
  * restricted by column, and the table-level grant makes it moot.
  */
-export async function checkInertColumnGrants(client: pg.Client, schemas: string[]): Promise<Finding[]> {
+export async function checkInertColumnGrants(client: Db, schemas: string[]): Promise<Finding[]> {
   const res = await client.query(
     `select n.nspname as schema, c.relname as "table",
             case t.grantee when 0 then 'public' else (select rolname::text from pg_roles where oid = t.grantee) end as role,
@@ -206,7 +206,7 @@ export function usesCurrentUser(body: string): boolean {
  * Inside SECURITY DEFINER, current_user is the function's owner, never the
  * caller. A check on it always gives the same answer.
  */
-export async function checkDefinerCurrentUser(client: pg.Client, schemas: string[]): Promise<Finding[]> {
+export async function checkDefinerCurrentUser(client: Db, schemas: string[]): Promise<Finding[]> {
   const res = await client.query(
     `select n.nspname as schema, p.proname as name, pg_get_function_identity_arguments(p.oid) as args,
             p.prosrc as src,
@@ -237,7 +237,7 @@ export async function checkDefinerCurrentUser(client: pg.Client, schemas: string
   return out;
 }
 
-export async function runChecks(client: pg.Client, schemas: string[]): Promise<Finding[]> {
+export async function runChecks(client: Db, schemas: string[]): Promise<Finding[]> {
   return [
     ...(await checkFunctionExecute(client, schemas)),
     ...(await checkRoleMembership(client)),

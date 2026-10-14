@@ -8,7 +8,7 @@ export interface RunModel {
   policyCount: number;
   tableCount: number;
   baselineAssertions?: number;
-  isolation: 'template' | 'in-place';
+  isolation: 'template';
   notes: string[];
   results: BreakResult[];
   findings: Finding[];
@@ -111,7 +111,7 @@ export function consoleReport(m: RunModel, color: boolean): string {
     const decided = m.results.length;
     row(
       'Sabotage',
-      `breaking each policy in turn and re-running the tests  (${decided} breaks, ${m.isolation === 'template' ? `${m.jobs} at a time, on database copies` : 'in place, one at a time'})`
+      `breaking each policy in turn and re-running the tests  (${decided} breaks, ${m.jobs} at a time, on database copies)`
     );
     for (const n of m.notes) out.push(dim(`  note: ${n}`));
     const w = String(s.caught + s.missed).length;
@@ -162,7 +162,7 @@ export function markdownReport(m: RunModel): string {
   lines.push(`- Database: \`${m.database}\` (${m.databaseSource})`);
   lines.push(`- Tests: ${m.testsDescription}`);
   lines.push(`- Policies: ${m.policyCount} on ${m.tableCount} tables in ${m.schemas.join(', ')}`);
-  lines.push(`- Isolation: ${m.isolation === 'template' ? 'database copies (CREATE DATABASE ... TEMPLATE)' : 'in place'}`);
+  lines.push(`- Isolation: database copies (CREATE DATABASE ... TEMPLATE)`);
   lines.push(`- Score: **${s.percent === null ? 'n/a' : s.percent + '%'}** (${s.caught} caught, ${s.missed} missed, ${s.skipped} skipped, ${s.errored} errored). Threshold ${m.threshold}%.`);
   if (s.errored) lines.push(`- **Warning:** ${s.errored} break(s) errored, so the tests did not run properly. The score leaves them out and may be too high.`);
   lines.push(`- Run time: ${(m.durationMs / 1000).toFixed(1)} s`, '');

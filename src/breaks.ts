@@ -225,7 +225,6 @@ export function generateBreaks(cat: Catalogue): GenerateResult {
     const base = { schema: p.schema, table: p.table, policy: p.name };
     const idOf = (kind: string, extra = '') => `${p.schema}.${p.table}/${p.name}/${kind}${extra}`;
     const dropSql = `drop policy ${qi(p.name)} on ${qt(p.schema, p.table)}`;
-    const recreate = createPolicySql(p);
     const verb = CMD_VERB[p.cmd];
 
     // 1. Drop the policy.
@@ -237,8 +236,7 @@ export function generateBreaks(cat: Catalogue): GenerateResult {
       effect: p.permissive
         ? `${who(p)} loses the access this policy granted`
         : `the restriction is gone, so ${who(p)} gets whatever the other policies allow`,
-      apply: [dropSql],
-      restore: [recreate]
+      apply: [dropSql]
     });
 
     // 2. USING becomes true.
@@ -251,8 +249,7 @@ export function generateBreaks(cat: Catalogue): GenerateResult {
         effect: p.permissive
           ? `any ${who(p)} ${verb} every row in the table, whatever tenant it belongs to`
           : `the restriction no longer filters any row`,
-        apply: [alterSql(p, 'using', 'true')],
-        restore: [alterSql(p, 'using', p.qual)]
+        apply: [alterSql(p, 'using', 'true')]
       });
     }
 
@@ -264,8 +261,7 @@ export function generateBreaks(cat: Catalogue): GenerateResult {
         kind: 'check-removed',
         label: 'WITH CHECK removed',
         effect: 'rows can be written that the policy would have rejected, for example into another tenant',
-        apply: [alterSql(p, 'with check', 'true')],
-        restore: [alterSql(p, 'with check', p.withCheck)]
+        apply: [alterSql(p, 'with check', 'true')]
       });
     }
 
@@ -289,8 +285,7 @@ export function generateBreaks(cat: Catalogue): GenerateResult {
             kind: 'conjunct-removed',
             label: `${clauseName} condition removed: ${oneLine(removed)}`,
             effect: `rows that fail this condition now pass the policy`,
-            apply: [alterSql(p, clause, rest)],
-            restore: [alterSql(p, clause, original)]
+            apply: [alterSql(p, clause, rest)]
           });
         });
       }
@@ -319,8 +314,7 @@ export function generateBreaks(cat: Catalogue): GenerateResult {
             kind: 'column-swapped',
             label: `${clauseName}: auth.uid() compared with ${alt.column} instead of ${cmp.column}`,
             effect: `the ownership check looks at ${cmp.scope.table}.${alt.column}, the wrong field`,
-            apply: [alterSql(p, clause, swapped)],
-            restore: [alterSql(p, clause, original)]
+            apply: [alterSql(p, clause, swapped)]
           });
         }
       }
@@ -334,8 +328,7 @@ export function generateBreaks(cat: Catalogue): GenerateResult {
         kind: 'restrictive-to-permissive',
         label: 'restrictive policy made permissive',
         effect: 'the policy now grants access instead of limiting it, because Postgres ORs permissive policies together',
-        apply: [dropSql, createPolicySql(p, { permissive: true })],
-        restore: [dropSql, recreate]
+        apply: [dropSql, createPolicySql(p, { permissive: true })]
       });
     }
   }
@@ -352,11 +345,7 @@ export function generateBreaks(cat: Catalogue): GenerateResult {
       policy: null,
       label: 'row level security disabled on the table',
       effect: 'every policy on the table is ignored and any role with a grant sees every row',
-      apply: [`alter table ${qt(t.schema, t.table)} disable row level security`],
-      restore: [
-        `alter table ${qt(t.schema, t.table)} enable row level security`,
-        ...(t.rlsForced ? [`alter table ${qt(t.schema, t.table)} force row level security`] : [])
-      ]
+      apply: [`alter table ${qt(t.schema, t.table)} disable row level security`]
     });
   }
 

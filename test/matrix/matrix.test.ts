@@ -114,6 +114,7 @@ describe.skipIf(!superUrl)('fixture matrix', () => {
         '--db-url', dbUrl,
         ...(expected.noAdminUrl ? [] : ['--admin-url', withDb(superUrl!, 'postgres')]),
         '--runner', 'psql',
+        '--yes',
         '--report', join(scratch, `${name}.md`),
         '--json-file', jsonFile,
         ...(expected.args ?? [])

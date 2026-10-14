@@ -31,7 +31,7 @@ inputs:
     description: >
       Version of the rls-saboteur npm package to run. The default is the version this
       release of the action ships with. The release step must keep it equal to package.json.
-    default: '0.1.1'
+    default: '0.2.0'
   extra-args:
     description: Extra command-line options for rls-saboteur.
     default: ''
@@ -75,7 +75,8 @@ runs:
         SABOTEUR_VERSION: ${{ inputs.version }}
         SABOTEUR_EXTRA: ${{ inputs.extra-args }}
       run: |
-        args=(--threshold "$SABOTEUR_THRESHOLD" --schemas "$SABOTEUR_SCHEMAS" --jobs "$SABOTEUR_JOBS" --json-file saboteur-report.json)
+        # --yes: a CI run has no terminal. The workflow file is the user's own approval of the plan.
+        args=(--threshold "$SABOTEUR_THRESHOLD" --schemas "$SABOTEUR_SCHEMAS" --jobs "$SABOTEUR_JOBS" --json-file saboteur-report.json --yes)
         if [ -n "$SABOTEUR_TEST" ]; then args+=(--test "$SABOTEUR_TEST"); fi
         read -r -a extra <<< "$SABOTEUR_EXTRA"
         set +e

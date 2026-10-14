@@ -16,8 +16,9 @@ Passing RLS tests prove little unless they fail when a policy breaks. RLS Sabote
 ## How to run it
 
 1. Confirm a local Supabase is running: `supabase status`.
-2. Run `npx rls-saboteur --json-file saboteur-report.json` from the project root.
-3. Read the exit code: 0 all caught, 1 misses or a failed check, 2 could not check.
+2. Show the user the plan in the chat and get an explicit yes. The tool asks "Continue? (y/N)" itself, but an agent has no terminal, so it can only run with `--yes`, which approves every question. **Never add `--yes` on the user's behalf without their yes to this plan.** Otherwise you approve, in their name, a plan they never saw. The plan: the database (name, host, local or not), how many policies will be broken (`npx rls-saboteur --dry-run` lists them and asks nothing), the test command (show a command from `.rls-saboteur.json` exactly, it runs as the user), that other connections to a local database will be closed for a moment to take the first copy, and that "It will not change this database. It works on temporary copies."
+3. After the yes, run `npx rls-saboteur --yes --json-file saboteur-report.json` from the project root.
+4. Read the exit code: 0 all caught, 1 misses or a failed check, 2 could not check.
 
 Options you may need: `--test "<cmd>"` for a custom test command, `--schemas a,b`, `--jobs 4`, `--only-related`, `--dry-run` to list the breaks, `--checks-only` for the checks that need no tests.
 

@@ -1,29 +1,27 @@
-import pg from 'pg';
+import { urlIsLocal } from './safety.js';
 import { withDatabase } from './config.js';
+import { Guard, PREFIX, LABEL_PREFIX, TERMINATE_SQL, copyOwnerPid, databaseOf, type Db } from './guard.js';
 import { qi } from './sql.js';
 import type { Break } from './types.js';
+
+export { copyOwnerPid };
 
 /**
  * Isolation.
  *
- * Template mode: every break runs on its own copy of the database, made with
- * CREATE DATABASE ... TEMPLATE. Postgres only allows that when nobody else is
- * connected to the source, and a running local Supabase stack always has
- * services connected (auth, REST, realtime). So the source is copied ONCE into
- * a master template, and each break copies the master. Taking that first copy
- * may need those connections closed for a moment. They reconnect by themselves.
+ * Every break runs on its own copy of the database, made with CREATE DATABASE ... TEMPLATE.
+ * Postgres only allows that when nobody else is connected to the source, and a running local
+ * Supabase stack always has services connected (auth, REST, realtime). So the source is copied
+ * ONCE into a master template, and each break copies the master. Taking that first copy may need
+ * those connections closed for a moment (local only, never with the remote flag). They reconnect.
  *
- * In-place mode: when no copy can be made, the break is applied to the real
- * local database and put back afterwards, one at a time.
+ * The source database is never altered: no setting is changed, no statement but a read is sent to
+ * it. Every copy carries a label, and only labelled copies are ever dropped. See guard.ts.
  */
 
-const PREFIX = 'saboteur_';
-
-export type IsolationMode = 'auto' | 'template' | 'in-place';
-
 export interface Isolation {
-  mode: 'template' | 'in-place';
-  /** Notes to show the user (what was disconnected, why in-place). */
+  mode: 'template';
+  /** Notes to show the user (what was disconnected). */
   notes: string[];
   withBreak<T>(brk: Break, fn: (dbUrl: string) => Promise<T>): Promise<T>;
   /** A database with no break applied, for the baseline check on the copy. */
@@ -31,45 +29,28 @@ export interface Isolation {
   dispose(): Promise<void>;
 }
 
-async function connect(url: string): Promise<pg.Client> {
-  const c = new pg.Client({ connectionString: url });
-  c.on('error', () => {});
-  await c.connect();
-  return c;
-}
-
 function sqlstate(e: unknown): string | undefined {
   return (e as { code?: string }).code;
 }
 
-function pidAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (e) {
-    return (e as NodeJS.ErrnoException).code === 'EPERM';
-  }
-}
-
-/** The pid in a database name this tool created, or null for any other name. */
-export function copyOwnerPid(datname: string): number | null {
-  const m = /^saboteur_(\d+)_(?:tpl|\d+)$/.exec(datname);
-  return m ? Number(m[1]) : null;
-}
-
-/** Drop copies left behind by earlier runs that died. Only copies whose owning process is gone. */
-export async function sweepStale(admin: pg.Client): Promise<number> {
-  const res = await admin.query(`select datname from pg_database where datname like 'saboteur\\_%'`);
+/**
+ * Drop copies left behind by earlier runs that died. A database is dropped only when its name matches
+ * saboteur_<pid>_..., its comment starts with "rls-saboteur copy " and its pid is dead.
+ */
+export async function sweepStale(admin: Db): Promise<number> {
+  const res = await admin.query(
+    `select datname, shobj_description(oid, 'pg_database') as label from pg_database where datname like 'saboteur\\_%'`
+  );
   let dropped = 0;
-  for (const { datname } of res.rows as { datname: string }[]) {
-    // Only databases this tool named: saboteur_<pid>_tpl or saboteur_<pid>_<n>.
-    const pid = copyOwnerPid(datname);
-    if (pid === null || pidAlive(pid)) continue;
+  for (const { datname, label } of res.rows as { datname: string; label: string | null }[]) {
+    if (copyOwnerPid(datname) === null) continue;
+    if (!label || !label.startsWith(LABEL_PREFIX)) continue;
     try {
+      // The guard repeats the label and pid checks inside the connection before it sends the drop.
       await admin.query(`drop database if exists ${qi(datname)} with (force)`);
       dropped++;
     } catch {
-      /* leave it; not ours to fight over */
+      /* alive, or not ours to fight over */
     }
   }
   return dropped;
@@ -77,50 +58,48 @@ export async function sweepStale(admin: pg.Client): Promise<number> {
 
 export interface IsolationOptions {
   sourceUrl: string;
-  mode: IsolationMode;
-  /** Allow closing other connections to the source for the first copy. */
+  /** Allow closing other connections to the source for the first copy (still needs a local host). */
   terminate: boolean;
+  /** The remote flag is in effect: closing sessions is then never allowed. */
+  allowRemote?: boolean;
   /**
    * A superuser URL, used only to copy and drop databases. A local Supabase stack keeps
    * connections open as a superuser (the cron scheduler), which the normal role cannot close.
    */
   adminUrl?: string;
+  /** Asked before any session on the source is closed. Return false to stop. */
+  confirmTerminate?: (n: number, applications: string[], db: string) => Promise<boolean>;
   /** Runs once on the master template, e.g. installing pgTAP. */
   prepareMaster?: (masterUrl: string) => Promise<void>;
 }
 
 export async function createIsolation(o: IsolationOptions): Promise<Isolation> {
-  const sourceDb = decodeURIComponent(new URL(o.sourceUrl).pathname.slice(1));
+  const sourceDb = databaseOf(o.sourceUrl);
   const adminDb = sourceDb === 'template1' ? 'postgres' : 'template1';
   const adminUrl = withDatabase(o.adminUrl ?? o.sourceUrl, adminDb);
   const owner = decodeURIComponent(new URL(o.sourceUrl).username);
   const notes: string[] = [];
+  const local = urlIsLocal(o.sourceUrl) && (!o.adminUrl || urlIsLocal(o.adminUrl));
+  const guard = new Guard({ sourceUrl: o.sourceUrl, allowTerminate: o.terminate && !o.allowRemote && local });
 
-  if (o.mode === 'in-place') return inPlace(o.sourceUrl, notes, 'in-place mode was requested');
-
-  const admin = await connect(adminUrl);
-  let master = '';
+  const admin = await guard.connect(adminUrl);
+  const master = `${PREFIX}${process.pid}_tpl`;
   let result: Isolation | null = null;
   try {
     await sweepStale(admin);
-    master = `${PREFIX}${process.pid}_tpl`;
-    const created = await makeMaster(admin, sourceDb, master, owner, o.terminate, notes, Boolean(o.adminUrl));
+    const created = await makeMaster(guard, admin, master, owner, o, notes);
     if (!created.ok) {
-      // In-place mode edits the user's own policies. A crash mid-run would leave them broken,
-      // so it is never a silent fallback: the user must ask for it.
       throw new Error(
         `Could not copy the database: ${created.reason}\n` +
-          `Fix it one of two ways:\n` +
-          `  1. Pass --admin-url with a superuser URL, used only to copy and drop databases.\n` +
-          `  2. Pass --isolation in-place. Each break is then applied to this database and put back. ` +
-          `A crash would leave a policy broken, so use it only on a throwaway local database.`
+          `Your database was not changed. If it is a local Supabase stack, pass --admin-url with a superuser URL, ` +
+          `used only to copy and drop databases. Otherwise free the database of other connections and run again.`
       );
     }
     const masterUrl = withDatabase(o.sourceUrl, master);
     try {
       if (o.prepareMaster) await o.prepareMaster(masterUrl);
     } catch (e) {
-      await admin.query(`drop database if exists ${qi(master)} with (force)`).catch(() => {});
+      await guard.dropCopy(admin, master).catch(() => {});
       throw e;
     }
 
@@ -128,13 +107,13 @@ export async function createIsolation(o: IsolationOptions): Promise<Isolation> {
     const live = new Set<string>();
     const withCopy = async <T>(brk: Break | null, fn: (dbUrl: string) => Promise<T>): Promise<T> => {
       const name = `${PREFIX}${process.pid}_${++counter}`;
-      const a = await connect(adminUrl);
+      const a = await guard.connect(adminUrl);
       live.add(name);
       try {
-        await a.query(`create database ${qi(name)} template ${qi(master)}${owner ? ` owner ${qi(owner)}` : ''}`);
+        await guard.createCopy(a, name, master, owner);
         const url = withDatabase(o.sourceUrl, name);
         if (brk) {
-          const c = await connect(url);
+          const c = await guard.connect(url);
           try {
             for (const stmt of brk.apply) await c.query(stmt);
           } finally {
@@ -143,7 +122,7 @@ export async function createIsolation(o: IsolationOptions): Promise<Isolation> {
         }
         return await fn(url);
       } finally {
-        await a.query(`drop database if exists ${qi(name)} with (force)`).catch(() => {});
+        await guard.dropCopy(a, name).catch(() => {});
         live.delete(name);
         await a.end().catch(() => {});
       }
@@ -163,10 +142,10 @@ export async function createIsolation(o: IsolationOptions): Promise<Isolation> {
       async dispose() {
         process.off('SIGINT', onSignal);
         process.off('SIGTERM', onSignal);
-        const a = await connect(adminUrl);
+        const a = await guard.connect(adminUrl);
         try {
-          for (const n of live) await a.query(`drop database if exists ${qi(n)} with (force)`).catch(() => {});
-          await a.query(`drop database if exists ${qi(master)} with (force)`).catch(() => {});
+          for (const n of live) await guard.dropCopy(a, n).catch(() => {});
+          await guard.dropCopy(a, master).catch(() => {});
         } finally {
           await a.end().catch(() => {});
         }
@@ -179,16 +158,15 @@ export async function createIsolation(o: IsolationOptions): Promise<Isolation> {
 }
 
 async function makeMaster(
-  admin: pg.Client,
-  sourceDb: string,
+  guard: Guard,
+  admin: Db,
   master: string,
   owner: string,
-  terminate: boolean,
-  notes: string[],
-  haveAdminUrl: boolean
+  o: IsolationOptions,
+  notes: string[]
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
-  const create = () =>
-    admin.query(`create database ${qi(master)} template ${qi(sourceDb)}${owner ? ` owner ${qi(owner)}` : ''}`);
+  const sourceDb = guard.sourceDb;
+  const create = () => guard.createCopy(admin, master, sourceDb, owner);
   try {
     await create();
     return { ok: true };
@@ -197,105 +175,49 @@ async function makeMaster(
   }
   // 55006: the source is in use.
   const others = await admin.query(
-    `select count(*)::int as n from pg_stat_activity where datname = $1 and pid <> pg_backend_pid()`,
+    `select count(*)::int as n, coalesce(array_agg(distinct nullif(application_name, '')), '{}') as apps
+       from pg_stat_activity where datname = $1 and pid <> pg_backend_pid()`,
     [sourceDb]
   );
   const n = others.rows[0].n as number;
-  if (!terminate) {
-    return { ok: false, reason: `${n} other connection(s) to "${sourceDb}" and --no-terminate was given` };
-  }
-  // Close the other connections just long enough to copy. Try to stop new ones first.
-  let blocked = false;
-  try {
-    await admin.query(`alter database ${qi(sourceDb)} with allow_connections false`);
-    blocked = true;
-  } catch {
-    /* not the owner: fall back to terminate-and-retry */
-  }
-  try {
-    for (let attempt = 0; attempt < 8; attempt++) {
-      // Only sessions this role may signal: its own, or any when it is a superuser.
-      await admin.query(
-        `select pg_terminate_backend(pid) from pg_stat_activity
-          where datname = $1 and pid <> pg_backend_pid()
-            and (usesysid = (select oid from pg_roles where rolname = current_user)
-                 or (select rolsuper from pg_roles where rolname = current_user))`,
-        [sourceDb]
-      );
-      try {
-        await create();
-        notes.push(
-          `Closed ${n} other connection(s) to "${sourceDb}" for a moment to copy it. Local services reconnect by themselves.`
-        );
-        return { ok: true };
-      } catch (e) {
-        if (sqlstate(e) !== '55006') return { ok: false, reason: (e as Error).message };
-        await new Promise((r) => setTimeout(r, 150));
-      }
-    }
+  const apps = ((others.rows[0].apps as (string | null)[]) ?? []).filter((a): a is string => Boolean(a)).sort();
+  if (!guard.allowTerminate) {
+    const why = o.allowRemote
+      ? 'closing other connections is never done together with the remote flag'
+      : !o.terminate
+        ? '--no-terminate was given'
+        : 'the host is not local';
     return {
       ok: false,
       reason:
-        `"${sourceDb}" still has connections that this role cannot close` +
-        (haveAdminUrl ? '' : ' (a local Supabase keeps a superuser cron connection open)')
+        `${n} other connection(s) to "${sourceDb}" are open and ${why}. ` +
+        `Stop the services that use the database (or point --db-url at a local scratch copy of it) and run again`
     };
-  } finally {
-    if (blocked) await admin.query(`alter database ${qi(sourceDb)} with allow_connections true`).catch(() => {});
   }
-}
-
-/**
- * In-place fallback. Applies one break to the real database, runs the callback,
- * then restores. Serial by construction. Restores on SIGINT and SIGTERM too.
- */
-async function inPlace(sourceUrl: string, notes: string[], why: string): Promise<Isolation> {
-  notes.push(
-    `No database copy was made (${why}). Each break is applied to your local database and put back afterwards, one at a time.`
-  );
-  let current: Break | null = null;
-  let chain: Promise<unknown> = Promise.resolve();
-
-  const restoreCurrent = async (): Promise<void> => {
-    if (!current) return;
-    const c = await connect(sourceUrl);
+  if (o.confirmTerminate && !(await o.confirmTerminate(n, apps, sourceDb))) {
+    return {
+      ok: false,
+      reason: `${n} other connection(s) to "${sourceDb}" are open, and you chose not to close them. Stop the services that use it and run again, or answer yes to close them for a moment`
+    };
+  }
+  // Close the other connections just long enough to copy. Nothing about the source is changed.
+  for (let attempt = 0; attempt < 8; attempt++) {
+    await admin.query(TERMINATE_SQL, [sourceDb]);
     try {
-      for (const stmt of current.restore) await c.query(stmt);
-      current = null;
-    } finally {
-      await c.end().catch(() => {});
+      await create();
+      notes.push(
+        `Closed ${n} other connection(s) to "${sourceDb}" for a moment to copy it. Local services reconnect by themselves.`
+      );
+      return { ok: true };
+    } catch (e) {
+      if (sqlstate(e) !== '55006') return { ok: false, reason: (e as Error).message };
+      await new Promise((r) => setTimeout(r, 150));
     }
-  };
-  const onSignal = (sig: NodeJS.Signals): void => {
-    restoreCurrent().finally(() => process.exit(sig === 'SIGINT' ? 130 : 143));
-  };
-  process.on('SIGINT', onSignal);
-  process.on('SIGTERM', onSignal);
-
+  }
   return {
-    mode: 'in-place',
-    notes,
-    withPristine: (fn) => fn(sourceUrl),
-    withBreak(brk, fn) {
-      const run = async () => {
-        const c = await connect(sourceUrl);
-        current = brk;
-        try {
-          for (const stmt of brk.apply) await c.query(stmt);
-          await c.end();
-          return await fn(sourceUrl);
-        } finally {
-          await c.end().catch(() => {});
-          await restoreCurrent();
-        }
-      };
-      const next = chain.then(run, run);
-      chain = next.catch(() => {});
-      return next as Promise<never>;
-    },
-    async dispose() {
-      process.off('SIGINT', onSignal);
-      process.off('SIGTERM', onSignal);
-      await restoreCurrent();
-    }
+    ok: false,
+    reason:
+      `"${sourceDb}" still has connections that this role cannot close` +
+      (o.adminUrl ? '' : ' (a local Supabase keeps a superuser cron connection open)')
   };
 }

@@ -93,7 +93,7 @@ describe('rls-saboteur against a real database', () => {
     const cli = join(root, 'dist', 'cli.js');
     const r = spawnSync(
       'node',
-      [cli, '--db-url', url(dbName), '--schemas', 'public', '--jobs', '2', '--json', '--report', join(root, 'e2e-report.md'),
+      [cli, '--db-url', url(dbName), '--schemas', 'public', '--jobs', '2', '--yes', '--json', '--report', join(root, 'e2e-report.md'),
        '--test', `psql "{{db_url}}" -X -q -v ON_ERROR_STOP=1 -f ${join(root, 'test/e2e/check.sql')}`],
       { encoding: 'utf8', cwd: root }
     );

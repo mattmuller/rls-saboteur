@@ -1,9 +1,11 @@
-import pg from 'pg';
 import { generateBreaks } from './breaks.js';
 import { readCatalogue } from './catalogue.js';
 import { runChecks } from './checks.js';
-import { type SkipRule, redact, scrubSecrets } from './config.js';
-import { createIsolation, type IsolationMode } from './isolation.js';
+import { CONFIG_FILE, type SkipRule, redact, scrubSecrets } from './config.js';
+import { createIsolation } from './isolation.js';
+import { Guard } from './guard.js';
+import type { Prompter } from './confirm.js';
+import { hostOf, urlIsLocal } from './safety.js';
 import { describeCatalogue, type RunModel } from './report.js';
 import { filesMentioning, type TestRun, type TestSuite } from './tests.js';
 import type { Break, BreakResult, Finding } from './types.js';
@@ -16,8 +18,12 @@ export interface RunOptions {
   jobs: number;
   threshold: number;
   timeoutMs: number;
-  isolation: IsolationMode;
   terminate: boolean;
+  allowRemote?: boolean;
+  /** Asks the owner. Every question defaults to No. */
+  confirm: Prompter;
+  /** The test command when it came from .rls-saboteur.json rather than --test. */
+  testFromConfig?: string;
   adminUrl?: string;
   adminNote?: string;
   onlyRelated: boolean;
@@ -55,9 +61,8 @@ export async function run(o: RunOptions): Promise<RunOutput> {
   };
 
   // Catalogue only. No user table is read.
-  const client = new pg.Client({ connectionString: o.dbUrl });
-  client.on('error', () => {});
-  await client.connect();
+  const sourceGuard = new Guard({ sourceUrl: o.dbUrl, allowTerminate: false });
+  const client = await sourceGuard.connect(o.dbUrl);
   let findings: Finding[];
   let breaks: Break[];
   try {
@@ -99,53 +104,56 @@ export async function run(o: RunOptions): Promise<RunOutput> {
     return { model, breaks };
   }
 
-  // Baseline on the real database. The psql runner needs pgTAP, which the real database may not
-  // have, so it takes its baseline on a prepared copy below instead.
-  if (suite.mode !== 'psql') {
-    o.progress('Running the tests once, unchanged...');
-    const base = await suite.run(o.dbUrl, { timeoutMs: o.timeoutMs });
-    if (base.status !== 'passed') {
-      model.couldNotCheck = `${baselineMessage(base, [o.dbUrl])}\n${tail(base.output, [o.dbUrl])}`;
-      model.durationMs = Date.now() - started;
-      return { model, breaks };
-    }
-    model.baselineAssertions = base.assertions;
+  // Nothing below this line touches the database except through copies. Ask first.
+  const dbName = decodeURIComponent(new URL(o.dbUrl).pathname.slice(1));
+  const local = urlIsLocal(o.dbUrl);
+  if (o.testFromConfig) {
+    const ok = await o.confirm.ask(
+      `The test command comes from ${CONFIG_FILE} in this project:\n  ${o.testFromConfig}\nRun it? (y/N)`,
+      `running the test command from ${CONFIG_FILE}: ${o.testFromConfig}`
+    );
+    if (!ok) return stopped(model, started, `you did not approve the test command from ${CONFIG_FILE}`, breaks);
+  }
+  const planText =
+    `Plan\n` +
+    `  Database: ${dbName} on ${scrubSecrets(hostOf(o.dbUrl), [o.dbUrl])} (${local ? 'local' : 'NOT local'})\n` +
+    `  It will: make temporary copies of it, break ${todo.length} policies in the copies, run: ${suite.description}\n` +
+    `  It will not change this database.\n` +
+    `Continue? (y/N)`;
+  if (!(await o.confirm.ask(planText, `the plan: temporary copies of "${dbName}", ${todo.length} breaks in the copies, tests run: ${suite.description}`))) {
+    return stopped(model, started, 'you answered No to the plan. Nothing was copied', breaks);
   }
 
   const iso = await createIsolation({
     sourceUrl: o.dbUrl,
-    mode: o.isolation,
     terminate: o.terminate,
+    allowRemote: o.allowRemote,
+    confirmTerminate: (n, apps, db) =>
+      o.confirm.ask(
+        `${n} other connection(s) are open to ${db} (${apps.length ? apps.join(', ') : 'no application name'}). Close them for a moment? They reconnect by themselves. (y/N)`,
+        `closing ${n} other connection(s) to "${db}" for a moment (local database only)`
+      ),
     adminUrl: o.adminUrl,
     prepareMaster: suite.prepare ? (url) => suite.prepare!(url) : undefined
   });
   try {
     model.isolation = iso.mode;
     model.notes = [...(o.adminNote ? [o.adminNote] : []), ...iso.notes].map((n) => scrubSecrets(n, [o.dbUrl]));
-    if (iso.mode === 'in-place' && suite.prepare) {
-      await suite.prepare(o.dbUrl);
-      model.notes.push('Installed the pgTAP extension in your local database, because the psql runner needs it.');
-    }
-    if (iso.mode === 'template' || suite.mode === 'psql') {
+    {
       const copyBase = await iso.withPristine((url) => suite.run(url, { timeoutMs: o.timeoutMs }));
       model.baselineAssertions ??= copyBase.assertions;
-      if (copyBase.status !== 'passed' && suite.mode === 'psql') {
-        model.couldNotCheck = `${baselineMessage(copyBase, [o.dbUrl])}\n${tail(copyBase.output, [o.dbUrl])}`;
-        model.durationMs = Date.now() - started;
-        return { model, breaks };
-      }
       if (copyBase.status !== 'passed') {
         model.couldNotCheck =
-          'the tests pass on your database but fail on an unchanged copy of it. ' +
-          'They probably depend on something a copy does not carry (a connection setting or an outside service). ' +
-          'Try --isolation in-place.\n' +
+          `${baselineMessage(copyBase, [o.dbUrl])}\n` +
+          `The baseline runs on an unchanged copy of your database, never on the database itself. ` +
+          `Tests that depend on a connection setting or an outside service may not work on a copy.\n` +
           tail(copyBase.output, [o.dbUrl]);
         model.durationMs = Date.now() - started;
         return { model, breaks };
       }
     }
 
-    const jobs = iso.mode === 'in-place' ? 1 : Math.max(1, o.jobs);
+    const jobs = Math.max(1, o.jobs);
     model.jobs = jobs;
     const testFilesByTable: Record<string, number> = {};
     if (suite.files.length) {
@@ -211,4 +219,10 @@ export function baselineMessage(base: TestRun, urls: string[]): string {
 function tail(s: string, urls: string[]): string {
   const lines = s.trim().split(/\r?\n/);
   return scrubSecrets(lines.slice(-15).join('\n'), urls);
+}
+
+function stopped(model: RunModel, started: number, why: string, breaks: Break[]): RunOutput {
+  model.couldNotCheck = `stopped before anything was copied: ${why}.`;
+  model.durationMs = Date.now() - started;
+  return { model, breaks };
 }

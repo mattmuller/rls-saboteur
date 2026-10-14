@@ -17,6 +17,41 @@ No configuration. It reads the database port from `supabase/config.toml`, every 
 
 Against a local Supabase stack, you may need `--admin-url postgres://supabase_admin:postgres@127.0.0.1:<port>/postgres`. Without it, the copy step can fail with "postgres still has connections that this role cannot close". Use the database port from `supabase status`.
 
+## What it will never do
+
+Your database is never touched. The tool works only on temporary copies. These are the guarantees, each with the test that proves it.
+
+- **It never changes the database you point it at.** It sends that database nothing but plain reads (`SELECT`). The connection is also opened read-only, so Postgres itself refuses a write. Proof: `guard: the source database is read-only` (test/guard.test.ts) and `source-untouched` (test/matrix/source-untouched.test.ts, which compares policies, table flags, the database row, its settings and its roles before and after a full run).
+- **It never changes a setting of that database.** There is no `ALTER DATABASE` step. Proof: `guard: the admin connection > refuses anything else, including changing the source database`.
+- **It only ever drops databases it made itself.** Every copy is labelled `rls-saboteur copy <random token>` the moment it exists. A drop is allowed only when the name starts with `saboteur_`, is not your database, and the label matches this run (or an earlier run whose process has died). Proof: `guard: the admin connection` (refuses unprefixed, source and unlabelled names) and `droppable`.
+- **It never closes your connections on a remote host, or when you gave `--no-terminate` or the remote flag.** On a local database it may close other sessions for a moment to take the first copy, and only after you say yes. Proof: `refuses to close sessions when terminating is not allowed` and `no-terminate-with-remote-flag`.
+- **A crash cannot leave your database changed.** There is nothing to undo. Proof: `crash-during-first-copy` kills the process with `kill -9` in the middle of the first copy, then checks the source accepts connections and is unchanged.
+- **It never runs without asking, unless you say `--yes`.** Proof: `confirmation steps` (test/confirm.test.ts), `run asks before it copies anything` (test/run-confirm.test.ts) and `no-prompt-without-yes`.
+
+What this does not cover: the test command you give it (`--test`, or the `test` value in `.rls-saboteur.json`) is your code and runs as you. It is passed the address of a copy only, but it is a shell command. The tool shows it to you before it runs when it comes from the config file.
+
+Versions before 0.2.0 had an `--isolation in-place` mode that edited your real database. It was removed in 0.2.0.
+
+### Confirmation steps
+
+Before anything is copied, the tool prints a plan and waits for you:
+
+```
+Plan
+  Database: postgres on 127.0.0.1 (local)
+  It will: make temporary copies of it, break 42 policies in the copies, run: supabase/tests/*.sql  (pgTAP, run with supabase test db)
+  It will not change this database.
+Continue? (y/N)
+```
+
+The default is No. An empty answer is No.
+
+1. **The plan.** As above.
+2. **Closing other sessions.** If the first copy needs it (local databases only): `N other connection(s) are open to <db> (<application names>). Close them for a moment? They reconnect by themselves. (y/N)`. No stops the run with the explanation.
+3. **A test command from `.rls-saboteur.json`.** The exact command is shown and you are asked before it runs. A command passed with `--test` on the command line is not asked about, because you typed it.
+
+With no terminal (stdin or stdout is not a TTY, or `CI=true`) the tool never prompts and never waits. Without `--yes` it exits 2 and names `--yes`. `--yes` approves all three questions, so pass it only for a run whose plan you have read. The GitHub Action passes `--yes`, because the workflow is your own.
+
 ## Before and after
 
 The `examples/demo` project is a small multi-tenant app (orgs, members, documents, invoices) with a pgTAP suite that looks complete and passes.
@@ -100,8 +135,8 @@ Score  100%   exit 0 (threshold 100%)
 ## How it works
 
 1. **Discover.** The database URL comes from `supabase/config.toml` (default port 54322) or `--db-url`. Policies come from `pg_policy`. Tests are the `.sql` files in `supabase/tests`.
-2. **Baseline.** It runs the tests unchanged. If they fail or cannot run, it stops with exit 2 and says so.
-3. **Copy.** It copies the database once into a master template. Then, for each break, it makes a throwaway database with `CREATE DATABASE ... TEMPLATE`, applies the break with DDL, runs the tests against that copy, and drops it. Your database is not changed.
+2. **Plan.** It shows the plan and asks (see Confirmation steps).
+3. **Copy and baseline.** It copies the database once into a labelled master template. It runs the tests once, unchanged, on a copy. If they fail or cannot run, it stops with exit 2 and says so. Then, for each break, it makes a throwaway database with `CREATE DATABASE ... TEMPLATE`, applies the break with DDL, runs the tests against that copy, and drops it. Your database is not changed.
 4. **Report.** Caught means a test failed. Missed means the tests passed. Error means the tests could not run, for example a crashed psql or a refused connection. An error is never a catch.
 
 ### How tests are pointed at a copy
@@ -116,21 +151,20 @@ Score  100%   exit 0 (threshold 100%)
 
 Postgres refuses to copy a database while anyone else is connected to it. A running local Supabase always has connections open (auth, REST, realtime), so a direct copy fails with "source database is being accessed by other users".
 
-RLS Saboteur handles this once, at the start. It closes the other connections for about a second, makes the master template, and lets them reconnect. It prints a note when it did so.
+RLS Saboteur handles this once, at the start, on a local database only, and only after you answer yes. It closes the other connections for about a second, makes the master template, and lets them reconnect. It prints a note when it did so. It changes no setting of your database to do this. With `--no-terminate`, with the remote flag, or on a remote host it never closes anything: a busy database is an error that tells you how to free it.
 
 A stock local Supabase stack has one more catch. The cron scheduler keeps a connection open as a superuser, and the normal `postgres` role cannot close it. So when the host is local and `supabase/config.toml` exists, RLS Saboteur tries the CLI's documented local superuser (`supabase_admin`, local default password) on the same host and port. It uses that role only to copy and drop databases, and prints one line saying so. If that login fails, pass your own with `--admin-url <superuser url>`.
 
-If no copy can be made, it stops with exit 2 and names both fixes. It never falls back to **in-place mode** by itself. In-place mode applies each break to your own database and puts the policy back afterwards. A crash or `kill -9` mid-run would leave a policy broken, so you must ask for it with `--isolation in-place`, and only on a throwaway local database. It restores on Ctrl-C.
+If no copy can be made, it stops with exit 2 and your database is untouched. Pass `--admin-url` with a superuser URL, or stop the services that use the database.
 
 ### Security notes
 
 - **`--test` and the `test` value in `.rls-saboteur.json` run as shell commands**, the same way `package.json` scripts do. Run the tool only in projects you trust, and never with a config file you did not read.
 - **In CI, never pass untrusted text to the Action's `extra-args` input.** It becomes command-line options. Pull request titles, branch names and comment bodies are untrusted. The same goes for the `test` input.
 - **Give the workflow the least permission.** Set `permissions: contents: read` on any workflow that uses the Action.
-- **In-place mode cannot restore after a hard kill** (`SIGKILL`, a crash or a power loss). A policy can stay broken. Use `--isolation in-place` only on a throwaway local database.
 - Passwords are passed to `psql` and the Supabase CLI in `PGPASSWORD`, not on the command line.
 
-On the demo project, 42 breaks took about 35 seconds on copies with `--jobs 2`, and about 90 seconds in place.
+On the demo project, 42 breaks took about 35 seconds on copies with `--jobs 2`.
 
 ## Plain Postgres (no Supabase)
 
@@ -180,10 +214,11 @@ A `FAIL` makes the exit code 1.
 --jobs <n>            Breaks run in parallel on copies. Default: 2
 --threshold <pct>     Fail below this score. Default: 100
 --only-related        Per break, run only the test files that mention the table
---isolation <mode>    template (default) or in-place. In-place is never chosen for you.
+--isolation template  Accepted for old scripts. `in-place` was removed in 0.2.0.
 --admin-url <url>     Superuser URL used only to copy and drop databases
 --tests-dir <dir>     Directory of pgTAP files. Default: supabase/tests
---no-terminate        Do not close other connections for the first copy
+--no-terminate        Never close other connections for the first copy
+--yes                 Approve the plan, closing local sessions and a config-file test command without asking (needed without a terminal)
 --filter <text>       Only breaks whose id contains this text
 --checks-only         Only the checks that need no tests
 --dry-run             List the breaks and stop
@@ -216,7 +251,7 @@ Every skip needs a written reason, and skipped breaks are listed in the report.
 
 - It refuses any database that is not local (`localhost`, `127.0.0.1`, `::1`, the Docker host) unless you pass `--allow-remote-i-understand-this-locks-tables`. Breaking a policy on a live database takes a lock and stalls it.
 - It never reads your rows. It reads the catalogue and runs your own tests.
-- Copies are named `saboteur_<pid>_<n>` and dropped after each break. A run that dies leaves none behind that the next run does not sweep.
+- Copies are named `saboteur_<pid>_<n>`, labelled, and dropped after each break. A run that dies leaves none behind that the next run does not sweep. A copy is swept only if it is labelled and its process is dead. See "What it will never do".
 - Test output is scrubbed of connection strings and passwords before it reaches a report.
 
 ## Claude Code
@@ -239,6 +274,8 @@ Every skip needs a written reason, and skipped breaks are listed in the report.
 ```
 
 It starts the database container only, runs the tool, writes the report to the job summary, and fails the job below the threshold.
+
+The Action passes `--yes`. A CI run has no terminal to ask on, and the workflow file is your own approval of the plan: temporary copies of the CI database, which is thrown away with the job.
 
 ### Security
 

@@ -1,11 +1,11 @@
-import pg from 'pg';
+import type { Db } from './guard.js';
 import type { Catalogue, ColumnInfo, Policy, TableInfo } from './types.js';
 
 /**
  * Read the policy catalogue. Only pg_* catalogue views are touched.
  * No user table is ever selected from.
  */
-export async function readCatalogue(client: pg.Client, schemas: string[]): Promise<Catalogue> {
+export async function readCatalogue(client: Db, schemas: string[]): Promise<Catalogue> {
   const policies = await client.query(
     `select n.nspname as schema, c.relname as "table", p.polname as name,
             case p.polcmd when 'r' then 'SELECT' when 'a' then 'INSERT' when 'w' then 'UPDATE'

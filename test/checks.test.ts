@@ -61,7 +61,7 @@ describe('containsWord', () => {
 });
 
 describe('score and exit code', () => {
-  const brk = (id: string) => ({ id, kind: 'drop-policy' as const, schema: 'public', table: 't', policy: 'p', label: '', effect: '', apply: [], restore: [] });
+  const brk = (id: string) => ({ id, kind: 'drop-policy' as const, schema: 'public', table: 't', policy: 'p', label: '', effect: '', apply: [] });
   const model = (outcomes: ('caught' | 'missed' | 'skipped')[], extra: Partial<RunModel> = {}): RunModel => ({
     database: '', databaseSource: '', testsDescription: '', schemas: ['public'], policyCount: 0, tableCount: 0,
     isolation: 'template', notes: [], findings: [], unparsed: [], policies: [], threshold: 100, jobs: 1, durationMs: 0,

@@ -114,7 +114,7 @@ describe('baseline error', () => {
 
 describe('score with errors', () => {
   it('leaves errors out of the score and warns', () => {
-    const brk = { id: 'a', kind: 'drop-policy', schema: 's', table: 't', policy: 'p', label: 'l', effect: 'e', apply: [], restore: [] } as Break;
+    const brk = { id: 'a', kind: 'drop-policy', schema: 's', table: 't', policy: 'p', label: 'l', effect: 'e', apply: [] } as Break;
     const m: RunModel = {
       database: 'x', databaseSource: 'x', testsDescription: 't', schemas: ['public'], policyCount: 1, tableCount: 1,
       isolation: 'template', notes: [], findings: [], unparsed: [], policies: [], threshold: 100, jobs: 1, durationMs: 1,

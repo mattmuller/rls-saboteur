@@ -2,13 +2,13 @@
 import { parseArgs } from 'node:util';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import pg from 'pg';
 import { CONFIG_FILE, discoverDbUrl, readFileConfig, scrubSecrets } from './config.js';
 import { REMOTE_FLAG, remoteRefusal, resolveConnection, stripRedirectEnv, urlIsLocal } from './safety.js';
 import { consoleReport, exitCode, jsonReport, markdownReport } from './report.js';
 import { run } from './run.js';
 import { discoverSuite } from './tests.js';
-import type { IsolationMode } from './isolation.js';
+import { Guard } from './guard.js';
+import { ApprovalRequired, makePrompter } from './confirm.js';
 
 let knownUrl: string[] = [];
 const HELP = `rls-saboteur: mutation testing for Postgres and Supabase RLS
@@ -32,10 +32,14 @@ Options
   --jobs <n>            Breaks to run in parallel on database copies. Default: 2
   --threshold <pct>     Fail below this score. Default: 100
   --only-related        Per break, run only the test files that mention the table
-  --isolation <mode>    template (default) or in-place. In-place edits your own database and is never chosen for you.
+  --isolation template  Kept for old scripts. Every run uses database copies. "in-place" was removed in 0.2.0.
   --admin-url <url>     Superuser URL used only to copy and drop databases. A local Supabase keeps a
                         superuser cron connection open; with this, copies (and --jobs) work.
-  --no-terminate        Do not close other connections to take the first copy. Falls back to in-place.
+  --no-terminate        Never close other connections to take the first copy. A busy database is then an error.
+                        (Closing them is only ever done on a local host, after you say yes.)
+  --yes                 Approve the plan, closing local sessions and a test command from ${CONFIG_FILE}
+                        without asking. Required when there is no terminal (CI). Only pass it
+                        for a run you have read the plan of.
   --timeout <seconds>   Per test run. Default: 600
   --filter <text>       Only breaks whose id contains this text
   --checks-only         Run only the checks that need no tests
@@ -64,6 +68,7 @@ async function main(): Promise<number> {
       'only-related': { type: 'boolean' },
       isolation: { type: 'string' },
       'no-terminate': { type: 'boolean' },
+      yes: { type: 'boolean' },
       'admin-url': { type: 'string' },
       timeout: { type: 'string' },
       filter: { type: 'string' },
@@ -113,22 +118,27 @@ async function main(): Promise<number> {
     const u = new URL(found.dbUrl);
     u.username = 'supabase_admin';
     u.password = 'postgres';
-    const probe = new pg.Client({ connectionString: u.toString(), connectionTimeoutMillis: 3000 });
-    probe.on('error', () => {});
+    const probeGuard = new Guard({ sourceUrl: found.dbUrl, allowTerminate: false });
+    let probe: Awaited<ReturnType<Guard['connect']>> | undefined;
     try {
-      await probe.connect();
+      probe = await probeGuard.connect(u.toString());
       adminUrlFinal = u.toString();
       adminNote = 'Using the local Supabase superuser (supabase_admin, the CLI default) only to copy and drop databases.';
     } catch {
       /* not a local Supabase, or a changed password: carry on without */
     } finally {
-      await probe.end().catch(() => {});
+      await probe?.end().catch(() => {});
     }
   }
 
-  const isolation = (v.isolation ?? 'auto') as IsolationMode;
-  if (!['auto', 'template', 'in-place'].includes(isolation)) {
-    process.stderr.write('--isolation must be auto, template or in-place\n');
+  if (v.isolation !== undefined && v.isolation !== 'template' && v.isolation !== 'auto') {
+    process.stderr.write(
+      v.isolation === 'in-place'
+        ? '--isolation in-place was removed in 0.2.0, because it changed the real database. ' +
+            'Every run now uses temporary copies and never changes your database. ' +
+            'If the copy fails (a local Supabase keeps a superuser connection open), pass --admin-url with a superuser URL.\n'
+        : '--isolation only accepts template. Every run uses database copies.\n'
+    );
     return 2;
   }
   const runner = (v.runner ?? 'auto') as 'auto' | 'supabase' | 'psql';
@@ -145,8 +155,10 @@ async function main(): Promise<number> {
     jobs: v.jobs ? Number(v.jobs) : 2,
     threshold: v.threshold ? Number(v.threshold) : (file.threshold ?? 100),
     timeoutMs: (v.timeout ? Number(v.timeout) : 600) * 1000,
-    isolation,
     terminate: !v['no-terminate'],
+    allowRemote,
+    confirm: makePrompter({ yes: Boolean(v.yes) }),
+    testFromConfig: !v.test && file.test ? file.test : undefined,
     adminUrl: adminUrlFinal,
     adminNote,
     onlyRelated: Boolean(v['only-related']),
@@ -177,7 +189,8 @@ async function main(): Promise<number> {
 main().then(
   (code) => process.exit(code),
   (e: Error) => {
-    process.stderr.write(`rls-saboteur could not check: ${scrubSecrets(e.message, knownUrl)}\n`);
+    const text = e instanceof ApprovalRequired ? e.message : `rls-saboteur could not check: ${e.message}`;
+    process.stderr.write(scrubSecrets(text, knownUrl) + '\n');
     process.exit(2);
   }
 );
