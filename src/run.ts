@@ -4,7 +4,7 @@ import { runChecks } from './checks.js';
 import { CONFIG_FILE, type SkipRule, redact, scrubSecrets } from './config.js';
 import { createIsolation } from './isolation.js';
 import { Guard } from './guard.js';
-import type { Prompter } from './confirm.js';
+import { type Prompter, visible } from './confirm.js';
 import { hostOf, urlIsLocal } from './safety.js';
 import { describeCatalogue, type RunModel } from './report.js';
 import { filesMentioning, type TestRun, type TestSuite } from './tests.js';
@@ -109,18 +109,18 @@ export async function run(o: RunOptions): Promise<RunOutput> {
   const local = urlIsLocal(o.dbUrl);
   if (o.testFromConfig) {
     const ok = await o.confirm.ask(
-      `The test command comes from ${CONFIG_FILE} in this project:\n  ${o.testFromConfig}\nRun it? (y/N)`,
-      `running the test command from ${CONFIG_FILE}: ${o.testFromConfig}`
+      `The test command comes from ${CONFIG_FILE} in this project:\n  ${visible(o.testFromConfig)}\nRun it? (y/N)`,
+      `running the test command from ${CONFIG_FILE}: ${visible(o.testFromConfig)}`
     );
     if (!ok) return stopped(model, started, `you did not approve the test command from ${CONFIG_FILE}`, breaks);
   }
   const planText =
     `Plan\n` +
-    `  Database: ${dbName} on ${scrubSecrets(hostOf(o.dbUrl), [o.dbUrl])} (${local ? 'local' : 'NOT local'})\n` +
-    `  It will: make temporary copies of it, break ${todo.length} policies in the copies, run: ${suite.description}\n` +
+    `  Database: ${visible(dbName)} on ${visible(scrubSecrets(hostOf(o.dbUrl), [o.dbUrl]))} (${local ? 'local' : 'NOT local'})\n` +
+    `  It will: make temporary copies of it, break ${todo.length} policies in the copies, run: ${visible(suite.description)}\n` +
     `  It will not change this database.\n` +
     `Continue? (y/N)`;
-  if (!(await o.confirm.ask(planText, `the plan: temporary copies of "${dbName}", ${todo.length} breaks in the copies, tests run: ${suite.description}`))) {
+  if (!(await o.confirm.ask(planText, `the plan: temporary copies of "${visible(dbName)}", ${todo.length} breaks in the copies, tests run: ${visible(suite.description)}`))) {
     return stopped(model, started, 'you answered No to the plan. Nothing was copied', breaks);
   }
 
@@ -130,8 +130,8 @@ export async function run(o: RunOptions): Promise<RunOutput> {
     allowRemote: o.allowRemote,
     confirmTerminate: (n, apps, db) =>
       o.confirm.ask(
-        `${n} other connection(s) are open to ${db} (${apps.length ? apps.join(', ') : 'no application name'}). Close them for a moment? They reconnect by themselves. (y/N)`,
-        `closing ${n} other connection(s) to "${db}" for a moment (local database only)`
+        `${n} other connection(s) are open to ${visible(db)} (${apps.length ? apps.map(visible).join(', ') : 'no application name'}). Close them for a moment? They reconnect by themselves. (y/N)`,
+        `closing ${n} other connection(s) to "${visible(db)}" for a moment (local database only)`
       ),
     adminUrl: o.adminUrl,
     prepareMaster: suite.prepare ? (url) => suite.prepare!(url) : undefined

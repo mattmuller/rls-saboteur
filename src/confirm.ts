@@ -13,6 +13,26 @@ export class ApprovalRequired extends Error {
   }
 }
 
+/**
+ * Text from the project or the database (a config-file command, a database or application name) shown
+ * in a question. Control characters, terminal escape sequences and bidirectional overrides are written
+ * out visibly (\x1b, \u202e, \n), so the text on screen is exactly what will run or be touched: a
+ * hostile .rls-saboteur.json cannot draw "npm test" over a different command.
+ */
+export function visible(text: string): string {
+  return text.replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, (c) => {
+    if (c === '\n') return '\\n';
+    if (c === '\t') return '\\t';
+    const code = c.charCodeAt(0);
+    return code <= 0xff ? `\\x${code.toString(16).padStart(2, '0')}` : `\\u${code.toString(16).padStart(4, '0')}`;
+  });
+}
+
+/** A whole question: our own line breaks stay, any other control character is made visible. */
+function safeQuestion(text: string): string {
+  return text.split('\n').map(visible).join('\n');
+}
+
 export interface Prompter {
   /** True when a person can answer. */
   readonly interactive: boolean;
@@ -72,11 +92,11 @@ export function makePrompter(o: PrompterOptions): Prompter {
     say: (t) => void out.write(t.endsWith('\n') ? t : t + '\n'),
     async ask(question, needed) {
       if (o.yes) {
-        out.write(`${question} yes (approved with --yes)\n`);
+        out.write(`${safeQuestion(question)} yes (approved with --yes)\n`);
         return true;
       }
       if (!interactive) throw new ApprovalRequired(needed);
-      out.write(`${question} `);
+      out.write(`${safeQuestion(question)} `);
       const answer = (await nextLine()).trim();
       return /^y(es)?$/i.test(answer);
     }

