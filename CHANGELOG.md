@@ -6,6 +6,10 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- README: a HOL Guard section. HOL Guard now ships the `command.rls-saboteur` extension (hol-guard#4636), which asks before an agent runs RLS Saboteur with a risky option.
+
 ### Changed
 
 - The GitHub Action now uses `supabase/setup-cli` v3.0.1 (installs the Supabase CLI from npm) and `actions/upload-artifact` v7.0.2. Its inputs and the report artifact are unchanged.

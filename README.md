@@ -10,6 +10,7 @@
 - **Exit codes.** `0` passed, `1` below the threshold or a check failed, `2` could not check.
 - **JSON.** Add `--json` to get one JSON object on stdout. The console report goes to stderr. `--json-file <path>` writes the same JSON to a file.
 - **No terminal.** An agent has no terminal to answer the plan question, so it must pass `--yes`. Pass it only for a run whose plan you have read. Closing other sessions on the database needs `--close-sessions`; `--yes` does not give it.
+- **HOL Guard.** If your agent runs under [HOL Guard](https://github.com/hashgraph-online/hol-guard), its `command.rls-saboteur` extension asks before an agent runs RLS Saboteur with a risky option. See [HOL Guard](#hol-guard).
 - **Rules for working on this repository** are in [AGENTS.md](AGENTS.md).
 
 Your Supabase RLS tests pass. This tool checks whether they would fail if a policy broke.
@@ -345,6 +346,19 @@ Not covered by the matrix, so not promised:
 - Windows.
 - The column swap is only generated for `auth.uid()` comparisons (see Plain Postgres).
 - Policies on a partition are broken separately from the parent's, because Postgres applies them separately. A partition with no RLS of its own has nothing to break.
+
+## HOL Guard
+
+[HOL Guard](https://github.com/hashgraph-online/hol-guard) reviews the commands an AI agent runs before they run. It ships an extension for RLS Saboteur, [`command.rls-saboteur`](https://github.com/hashgraph-online/hol-guard/blob/main/contributions/extensions/command.rls-saboteur.json), added in [hol-guard#4636](https://github.com/hashgraph-online/hol-guard/pull/4636). It has four permissions:
+
+| Permission | Tier | It covers |
+|---|---|---|
+| `copy-run` | medium | any run, because a run copies your database |
+| `remote-override` | high | `--allow-remote-i-understand-this-locks-tables` |
+| `close-sessions` | high | `--close-sessions` |
+| `no-isolate-network` | medium | `--no-isolate-network`, which turns off network isolation in the copies |
+
+Turn a permission off and Guard blocks that kind of run instead of asking. It recognises `rls-saboteur` run directly and through npx, npm, pnpm, yarn and bun, with or without a version. One limit: after npm's own `--` on a versioned launch (`npm exec rls-saboteur@x -- ...`), a flag is matched only when it comes first or right after `--yes`; in any other position that run is still reviewed as a `copy-run`.
 
 ## Related tools
 
