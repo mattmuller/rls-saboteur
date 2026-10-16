@@ -8,6 +8,7 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- README: a Roadmap section (sandbox mode, schema-and-seed copies, masking, pg_cron), and the Safety section now says copies hold the same rows as the source.
 - README: a HOL Guard section. HOL Guard now ships the `command.rls-saboteur` extension (hol-guard#4636), which asks before an agent runs RLS Saboteur with a risky option.
 
 ### Changed

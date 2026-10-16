@@ -291,6 +291,7 @@ Every skip needs a written reason, and skipped breaks are listed in the report.
 - It never changes your database. It reads the catalogue, and your rows are copied into temporary databases on the same server, which are dropped afterwards. It runs your own tests on the copies.
 - Copies are named `saboteur_<host id>_<pid>_<run token>_<n>`, labelled, and dropped after each break. A run that dies leaves none behind that the next run does not sweep. A copy is swept only if its name or label says it was made by this host and its process is dead. See "What it will never do".
 - Test output is scrubbed of connection strings and passwords before it reaches a report.
+- Copies hold the same rows as the source. Nothing is masked, so point it at a database with seed or test data, which is what the default (your local Supabase) normally holds.
 
 ## Claude Code
 
@@ -369,6 +370,15 @@ Turn a permission off and Guard blocks that kind of run instead of asking. It re
 - [supabase-test-helpers](https://github.com/usebasejump/supabase-test-helpers) provides pgTAP helpers for signing in as a user inside a test.
 
 RLS Saboteur works on top of the tests that SupaShield and rlsautotest generate: generate a suite with one of them, then run RLS Saboteur to see which breaks that suite misses.
+
+## Roadmap
+
+Planned, in no fixed order. Ideas and pull requests are welcome.
+
+- **Sandbox mode.** Run the copies inside a Docker container, so no database copy is made on the machine you run it from.
+- **Schema and seed only.** Build each copy from your schema and `seed.sql` instead of cloning the source, so no real rows are ever copied.
+- **Masking.** Scramble chosen columns in the first copy, before any break runs.
+- **pg_cron.** Test and document whether scheduled jobs can fire inside a copy.
 
 ## Develop
 
