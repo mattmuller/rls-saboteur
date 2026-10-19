@@ -6,6 +6,10 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-19
+
+Documentation and tooling only. The CLI behaves exactly as in 0.2.0.
+
 ### Added
 
 - README: a Roadmap section (sandbox mode, schema-and-seed copies, masking, pg_cron), and the Safety section now says copies hold the same rows as the source.
@@ -85,7 +89,8 @@ The tool can now change only its own temporary copies. Every item below says wha
 - A demo project with a passing but weak suite and a fixed suite. (ff9378d)
 - A fixture matrix of six synthetic schemas, run end to end on PostgreSQL 16 and 17. (642c948)
 
-[Unreleased]: https://github.com/mattmuller/rls-saboteur/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/mattmuller/rls-saboteur/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/mattmuller/rls-saboteur/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/mattmuller/rls-saboteur/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/mattmuller/rls-saboteur/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/mattmuller/rls-saboteur/releases/tag/v0.1.0
