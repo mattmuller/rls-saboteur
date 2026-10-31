@@ -12,6 +12,9 @@ import { connectionParamProblem } from './urls.js';
 import { DEFAULT_MAX_SIZE, parseJobs, parsePercent, parseRunner, parseSeconds, parseSize } from './options.js';
 import { visible } from './confirm.js';
 import { ApprovalRequired, makePrompter } from './confirm.js';
+import { parseMask } from './mask.js';
+import { discoverBuildFiles } from './files.js';
+import { IMAGE_PATTERN } from './docker.js';
 
 let knownUrl: string[] = [];
 const HELP = `rls-saboteur: mutation testing for Postgres and Supabase RLS
@@ -49,6 +52,17 @@ Options
   --yes                 Approve the plan and a test command from ${CONFIG_FILE} without asking.
                         Required when there is no terminal (CI). Only pass it for a run you have read the
                         plan of. It does not approve closing sessions (see --close-sessions).
+  --from-files          Build the copies from supabase/migrations/*.sql and supabase/seed.sql instead of cloning the
+                        database. No row of your database is copied. The policies in the files must match it.
+  --migrations-dir <d>  With --from-files: the migrations directory. Default: supabase/migrations
+  --seed-file <path>    With --from-files: the seed file. Default: supabase/seed.sql (optional)
+  --mask <col>          Scramble schema.table.column in the first copy, before any break runs. Repeat for more.
+                        schema.table.column=null sets it to NULL instead. If a column cannot be masked, the run stops.
+  --sandbox             Run the copies in a throwaway Docker container (127.0.0.1 only) instead of on the server
+                        that holds your database. The rows are streamed in with pg_dump unless --from-files is given.
+  --sandbox-image <i>   Image for --sandbox. Default: postgres:<major version of your database>
+  --sandbox-host-network  With --sandbox and a dump: allow pg_dump to run on the host network when the container cannot reach a
+                        database on 127.0.0.1 (Docker Engine for Linux). Automatic for the default image only.
   --timeout <seconds>   Per test run. Default: 600
   --filter <text>       Only breaks whose id contains this text
   --checks-only         Run only the checks that need no tests
@@ -83,6 +97,13 @@ async function main(): Promise<number> {
       'no-isolate-network': { type: 'boolean' },
       yes: { type: 'boolean' },
       'admin-url': { type: 'string' },
+      'from-files': { type: 'boolean' },
+      'migrations-dir': { type: 'string' },
+      'seed-file': { type: 'string' },
+      mask: { type: 'string', multiple: true },
+      sandbox: { type: 'boolean' },
+      'sandbox-image': { type: 'string' },
+      'sandbox-host-network': { type: 'boolean' },
       timeout: { type: 'string' },
       filter: { type: 'string' },
       'checks-only': { type: 'boolean' },
@@ -113,7 +134,13 @@ async function main(): Promise<number> {
   const threshold = v.threshold !== undefined ? parsePercent(v.threshold, '--threshold') : file.threshold !== undefined ? parsePercent(String(file.threshold), `"threshold" in ${CONFIG_FILE}`) : 100;
   const jobs = v.jobs !== undefined ? parseJobs(v.jobs) : 2;
   const timeoutSeconds = v.timeout !== undefined ? parseSeconds(v.timeout) : 600;
-  const runner = parseRunner(v.runner);
+  let runner = parseRunner(v.runner);
+  if (v.sandbox) {
+    // The Supabase CLI runs pg_prove in its own container, which on Docker Desktop for Mac could not reach the sandbox
+    // (connection refused, in both modes). psql and --test run on this machine and do.
+    if (runner === 'supabase') throw new Error('--runner supabase does not work with --sandbox: the Supabase CLI runs pg_prove in a container that cannot reach the sandbox. Use --runner psql (the default with --sandbox) or --test.');
+    if (runner === 'auto') runner = 'psql';
+  }
   const maxSizeBytes = v['max-size'] !== undefined ? parseSize(v['max-size']) : DEFAULT_MAX_SIZE;
   if (v['isolate-network'] && v['no-isolate-network']) throw new Error('--isolate-network and --no-isolate-network contradict each other.');
   const urlProblem =
@@ -128,6 +155,18 @@ async function main(): Promise<number> {
     process.stderr.write(sourceName + '\n');
     return 2;
   }
+  const fromFiles = Boolean(v['from-files']);
+  const sandbox = Boolean(v.sandbox);
+  if (!fromFiles && (v['migrations-dir'] !== undefined || v['seed-file'] !== undefined)) throw new Error('--migrations-dir and --seed-file need --from-files.');
+  if (!sandbox && v['sandbox-host-network']) throw new Error('--sandbox-host-network needs --sandbox.');
+  if (fromFiles && v['sandbox-host-network']) throw new Error('--sandbox-host-network is for a dump. With --from-files nothing reaches your database.');
+  if (!sandbox && v['sandbox-image'] !== undefined) throw new Error('--sandbox-image needs --sandbox.');
+  if (sandbox && v['admin-url']) throw new Error('--admin-url is not used with --sandbox: the container is the server that makes the copies.');
+  if (v['sandbox-image'] !== undefined && (!IMAGE_PATTERN.test(v['sandbox-image']) || v['sandbox-image'].startsWith('-'))) {
+    throw new Error(`--sandbox-image "${v['sandbox-image']}" is not an image name.`);
+  }
+  const masks = [...(file.mask ?? []), ...(v.mask ?? [])].map(parseMask);
+  const buildFiles = fromFiles ? discoverBuildFiles(cwd, v['migrations-dir'], v['seed-file']) : null;
   const allowRemote = Boolean(v[REMOTE_FLAG.slice(2)]);
   const refusal =
     remoteRefusal(found.dbUrl, allowRemote) ?? (v['admin-url'] ? remoteRefusal(v['admin-url'], allowRemote) : null);
@@ -147,7 +186,7 @@ async function main(): Promise<number> {
   // password). It is not a secret. It is used only to copy and drop databases.
   let adminNote: string | undefined;
   let adminUrlFinal = adminUrl;
-  if (!adminUrlFinal && !v['no-terminate'] && existsSync(join(cwd, 'supabase', 'config.toml')) && urlIsLocal(found.dbUrl)) {
+  if (!sandbox && !adminUrlFinal && !v['no-terminate'] && existsSync(join(cwd, 'supabase', 'config.toml')) && urlIsLocal(found.dbUrl)) {
     const u = new URL(found.dbUrl);
     u.username = 'supabase_admin';
     u.password = 'postgres';
@@ -203,6 +242,12 @@ async function main(): Promise<number> {
     dryRun: Boolean(v['dry-run']),
     filter: v.filter,
     skip: file.skip ?? [],
+    cwd,
+    buildFiles,
+    sandbox,
+    sandboxImage: v['sandbox-image'],
+    sandboxHostNetwork: Boolean(v['sandbox-host-network']),
+    masks,
     progress: (line) => {
       if (tty) process.stderr.write(`\r\x1b[K${line}`);
     }

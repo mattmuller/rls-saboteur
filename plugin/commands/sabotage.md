@@ -21,6 +21,8 @@ Run this from the project root. Add any options the user passed: $ARGUMENTS
 5. If the database has other connections open (a running Supabase stack always does), say that taking the first copy needs them closed for a moment, and that they reconnect by themselves. **This is a second, separate question.** `--yes` does not answer it. Ask "Close the other sessions for a moment?" and wait for its own yes. Only a yes to that question lets you add `--close-sessions`.
 6. Ask "Continue?" and wait for an explicit yes in the chat. Silence, a vague answer or an earlier yes for a different plan is not a yes. If the answer is no, stop.
 
+If the user wants no copy on their own server or no real rows read, offer `--sandbox` (a Docker container) and `--from-files` (needs `--sandbox`: schema and seed only), and `--mask schema.table.column` for chosen columns. Say that `--sandbox` starts a container and `--sandbox-image` runs an image of their choice, and get their yes to that as part of the plan.
+
 Only after the yes, run with `--yes` (and `--close-sessions` only if the user said yes to closing sessions):
 
 ```

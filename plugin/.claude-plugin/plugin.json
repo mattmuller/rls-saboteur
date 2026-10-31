@@ -1,6 +1,6 @@
 {
   "name": "rls-saboteur",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Mutation testing for Postgres and Supabase RLS. Breaks each policy on purpose, lists the breaks your tests miss, and writes the missing pgTAP tests.",
   "author": { "name": "Matt Muller" },
   "homepage": "https://github.com/mattmuller/rls-saboteur",

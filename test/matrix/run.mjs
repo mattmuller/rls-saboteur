@@ -14,7 +14,17 @@ const port = (v) => 55400 + Number(v);
 const portB = (v) => 55500 + Number(v);
 const name = (v) => `rls-saboteur-ci-${v}`;
 const nameB = (v) => `rls-saboteur-ci-b-${v}`;
+// A third server with pg_cron preloaded, for the pg_cron test only.
+const portC = (v) => 55600 + Number(v);
+const nameC = (v) => `rls-saboteur-ci-cron-${v}`;
 const image = (v) => `rls-saboteur-ci-pg:${v}`;
+
+// Docker Hub, not ECR Public: ECR refused an anonymous pull from a runner ("Data limit exceeded").
+const SUPABASE_CI_IMAGE = 'supabase/postgres:17.6.1.011';
+function supabaseImageFor(v) {
+  if (process.env.SABOTEUR_MATRIX_SUPABASE_IMAGE) return process.env.SABOTEUR_MATRIX_SUPABASE_IMAGE;
+  return process.env.CI && v === '17' ? SUPABASE_CI_IMAGE : '';
+}
 
 function sh(cmd, args, opts = {}) {
   return spawnSync(cmd, args, { stdio: 'inherit', cwd: root, ...opts });
@@ -29,16 +39,16 @@ if (busy) console.log(`load ${loadavg()[0].toFixed(1)} on ${cpus().length} cores
 
 function removeContainer(v) {
   // The name check is the safety: only our own containers are ever removed.
-  for (const n of [name(v), nameB(v)]) {
+  for (const n of [name(v), nameB(v), nameC(v)]) {
     if (!n.startsWith('rls-saboteur-ci-')) continue;
     quiet('docker', ['rm', '-f', n]);
   }
 }
 
-function startServer(v, n, p) {
+function startServer(v, n, p, extra = []) {
   const r = sh('docker', [
     'run', '-d', '--name', n, '-e', 'POSTGRES_PASSWORD=postgres', '-p', `127.0.0.1:${p}:5432`,
-    image(v), '-c', 'cluster_name=rls-saboteur-ci', '-c', 'fsync=off', '-c', 'max_connections=200'
+    image(v), '-c', 'cluster_name=rls-saboteur-ci', '-c', 'fsync=off', '-c', 'max_connections=200', ...extra
   ], { stdio: ['ignore', 'ignore', 'inherit'] });
   if (r.status !== 0) throw new Error(`could not start ${n} (is port ${p} free?)`);
 }
@@ -62,9 +72,10 @@ try {
     started.push(v);
     startServer(v, name(v), port(v));
     startServer(v, nameB(v), portB(v));
+    startServer(v, nameC(v), portC(v), ['-c', 'shared_preload_libraries=pg_cron', '-c', 'cron.database_name=postgres']);
   }
   for (const v of started) {
-    for (const n of [name(v), nameB(v)]) {
+    for (const n of [name(v), nameB(v), nameC(v)]) {
       let ready = false;
       for (let i = 0; i < 90 && !ready; i++) {
         ready = isReady(n);
@@ -75,11 +86,17 @@ try {
   }
   for (const v of started) {
     console.log(`\n=== PostgreSQL ${v} (port ${port(v)}) ===`);
-    const [vc, va] = niced('npx', ['vitest', 'run', '--config', 'vitest.matrix.config.ts']);
+    const [vc, va] = niced('npx', ['vitest', 'run', '--config', 'vitest.matrix.config.ts', ...process.argv.slice(2)]);
     const r = sh(vc, va, { env: {
       ...process.env,
       SABOTEUR_MATRIX_URL: `postgres://postgres:postgres@127.0.0.1:${port(v)}/postgres`,
-      SABOTEUR_MATRIX_URL_B: `postgres://postgres:postgres@127.0.0.1:${portB(v)}/postgres`
+      SABOTEUR_MATRIX_URL_B: `postgres://postgres:postgres@127.0.0.1:${portB(v)}/postgres`,
+      SABOTEUR_MATRIX_URL_CRON: `postgres://postgres:postgres@127.0.0.1:${portC(v)}/postgres`,
+      SABOTEUR_MATRIX_IMAGE: image(v),
+      // The Supabase tests need the image. Set SABOTEUR_MATRIX_SUPABASE_IMAGE for a local copy. In CI (CI is set) the public
+      // image is pulled for the PostgreSQL 17 run, so those tests are not skipped there. The image is PostgreSQL 17, so the
+      // 16 run does not use it.
+      ...(supabaseImageFor(v) ? { SABOTEUR_MATRIX_SUPABASE_IMAGE: supabaseImageFor(v) } : {})
     } });
     if (r.status !== 0) failed = true;
   }

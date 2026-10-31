@@ -6,6 +6,32 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-31
+
+Four options from the roadmap. A run without the new options sends the same statements as 0.2.1. The only change in its output is a new `masked` list (empty) in the JSON report.
+
+### Added
+
+- `--sandbox`: the copies live in a throwaway PostgreSQL container on `127.0.0.1`, not on the server that holds your database. Nothing is created or locked there and no session on it is closed. The container is removed at the end, on Ctrl-C and SIGTERM, and, through a detached watchdog, after `kill -9`. The next run removes the containers of dead processes of the same host. Every `docker` call goes through an allowlist (`src/docker.ts`). Rows reach the container through `pg_dump`, in a read-only session; triggers are created after the data, so none fires during the load. `--sandbox-image` picks the image (default `postgres:<major version>`).
+- `--from-files` (with `--migrations-dir` and `--seed-file`): the copies are built from `supabase/migrations/*.sql` and `supabase/seed.sql`, so no row of your database is read. It needs `--sandbox`, because the files are your code and would otherwise run with your database user's rights on your own server. In a sandbox the container runs with `--network none` and publishes no port, so it has no route to your machine or the internet. This tool reaches it through `docker exec`. Every sandbox starts with scram-sha-256 on host connections and a random password, and the tool checks it: a wrong password for the right user and a random user on `template1` must both be refused as a password failure, no `pg_hba.conf` host rule may need no password, and the checks run again after your files or the dump have run. After the build, the policies of the copy must equal the policies of your database, or the run exits 2. Outbound HTTP is switched off after every file.
+- `--mask schema.table.column[=null]` (and `"mask"` in `.rls-saboteur.json`): scrambles chosen columns in the first copy before pgTAP, the baseline or any break. It fails closed: a missing column, a type it cannot scramble, an error, a row not rewritten, an original value left in the column or in `pg_stats`, `pg_stats_ext` or `pg_stats_ext_exprs` stops the run with exit 2. `VACUUM FULL` and `ANALYZE` remove old values from dead rows, indexes and statistics, for the table and every inheritance child and partition below it. A foreign table below it stops the run, a table that has a parent cannot be masked on its own (mask the root), and the run stops if a table in the tree has a parent outside it, if an `UPDATE` rule or a materialized view would keep a copy, or if a foreign key (in either direction, along a chain of keys) ties another column to the masked one and that column is not masked too. A materialized view is found through any number of views. Masking is documented as covering stated, tested cases only: it does not find values copied into other tables or typed into free text.
+- The Supabase Postgres image works in sandbox mode. The tool replaces the image's `pg_hba.conf` (which trusts loopback) and proves the replacement with the same checks, so a run on an image that still lets a client in exits 2. With `--from-files`, and for a dump from an image that has them, the master is a clone of the image's own `postgres` database (schemas `auth`, `storage`, ...). A dump of a managed database covers only `--schemas` and creates foreign keys to other schemas `NOT VALID`. Tested end to end on a Supabase-shaped project. The Supabase CLI runner (`supabase test db`) does not reach the sandbox, so `--runner supabase` with `--sandbox` exits 2 and `psql` is the default there.
+- The guard allows one new statement, `CREATE DATABASE <own master> TEMPLATE template0`, only in build mode and only for the master.
+- A pg_cron section in the README, and a matrix test on PostgreSQL 16 and 17 with `pg_cron` preloaded. A scheduled job does not run in a copy.
+- CI now runs the four Supabase sandbox tests (the PostgreSQL 17 run pulls the public image). Before, they ran only where `SABOTEUR_MATRIX_SUPABASE_IMAGE` was set.
+- The matrix image now includes `pg_cron`, and the matrix starts a third server for it (`rls-saboteur-ci-cron-<version>`, port 55616 and 55617).
+
+### Fixed (found by the first run on Docker Engine for Linux, GitHub Actions)
+
+- Dump mode could not reach a source on `127.0.0.1` on Linux, because `host.docker.internal` is the bridge gateway there and does not reach loopback. The tool now checks with `pg_isready` from inside the container and, only on exit 2 (no response) for a source on loopback, runs `pg_dump` in a helper container on the host network (`--entrypoint pg_dump`), piped into the sandbox. The plan names this. It is automatic for the default `postgres:<major>` image only; a `--sandbox-image` you chose needs the new flag `--sandbox-host-network`, or the run stops. The allowlist accepts that one shape. The container with the copies never gets the host network. On Docker Desktop nothing changes.
+- A relay connection that ended without the closing message stayed open in the container, because the relay's reader kept the socket after its writer ended. That could keep the master copy in use and fail the next copy with "source database ... is being accessed by other users". The relay now closes its end when its input ends, and waits for its reader so that the server does not take a signalled child for a crashed backend.
+- Test only: the `sandbox-isolated` control connected to a loopback-only database, which Linux Engine refuses. It now uses a listener on all interfaces.
+
+### Changed
+
+- The JSON report has a `masked` list, and `isolation` can be `sandbox`.
+- README: the Roadmap section is replaced by documentation of the four items and a short Ideas list.
+
 ## [0.2.1] - 2026-10-19
 
 Documentation and tooling only. The CLI behaves exactly as in 0.2.0.
@@ -89,7 +115,8 @@ The tool can now change only its own temporary copies. Every item below says wha
 - A demo project with a passing but weak suite and a fixed suite. (ff9378d)
 - A fixture matrix of six synthetic schemas, run end to end on PostgreSQL 16 and 17. (642c948)
 
-[Unreleased]: https://github.com/mattmuller/rls-saboteur/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/mattmuller/rls-saboteur/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/mattmuller/rls-saboteur/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/mattmuller/rls-saboteur/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/mattmuller/rls-saboteur/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/mattmuller/rls-saboteur/compare/v0.1.0...v0.1.1

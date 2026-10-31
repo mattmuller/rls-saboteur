@@ -5,6 +5,7 @@ import { readIdentity, sameServer } from './facts.js';
 import { isolateNetwork } from './network.js';
 import { hostOf } from './safety.js';
 import { qi } from './sql.js';
+import { applyMasks, type MaskSpec, type MaskedColumn } from './mask.js';
 import type { Break } from './types.js';
 
 export { copyOwnerPid };
@@ -23,9 +24,11 @@ export { copyOwnerPid };
  */
 
 export interface Isolation {
-  mode: 'template';
+  mode: 'template' | 'files' | 'sandbox';
   /** Notes to show the user (what was disconnected). */
   notes: string[];
+  /** The columns masked in the first copy, with the rows rewritten. Empty when --mask was not given. */
+  masked: MaskedColumn[];
   withBreak<T>(brk: Break, fn: (dbUrl: string) => Promise<T>): Promise<T>;
   /** A database with no break applied, for the baseline check on the copy. */
   withPristine<T>(fn: (dbUrl: string) => Promise<T>): Promise<T>;
@@ -77,6 +80,19 @@ export interface IsolationOptions {
   cleanupWaitMs?: number;
   /** Runs once on the master template, e.g. installing pgTAP. */
   prepareMaster?: (masterUrl: string) => Promise<void>;
+  /** Columns to scramble in the master, after it is built and before anything else touches it. */
+  masks?: MaskSpec[];
+  /**
+   * Build mode: runs on the new master and fills it, from files or a dump. With emptyMaster the master starts EMPTY (from
+   * template0) and nothing is cloned. Without it, the master is a clone of the source database (the sandbox uses this for the
+   * database an image ships with) and the build adds to it.
+   */
+  build?: (masterUrl: string, guard: Guard, between: () => Promise<void>) => Promise<void>;
+  emptyMaster?: boolean;
+  /** Runs on the built master. A throw stops the run (for example: the files do not rebuild the policies of the database). */
+  verifyMaster?: (masterUrl: string) => Promise<void>;
+  /** Sandbox mode owns the signal handler, because removing the container removes every copy in it. Default true. */
+  manageSignals?: boolean;
 }
 
 export async function createIsolation(o: IsolationOptions): Promise<Isolation> {
@@ -88,7 +104,7 @@ export async function createIsolation(o: IsolationOptions): Promise<Isolation> {
   const local = urlIsLocal(o.sourceUrl) && (!o.adminUrl || urlIsLocal(o.adminUrl));
   const sourceProblem = sourceNameProblem(sourceDb);
   if (sourceProblem) throw new Error(sourceProblem);
-  const guard = new Guard({ sourceUrl: o.sourceUrl, allowTerminate: o.terminate && !o.allowRemote && local });
+  const guard = new Guard({ sourceUrl: o.sourceUrl, allowTerminate: o.terminate && !o.allowRemote && local && !o.emptyMaster, emptyMaster: o.emptyMaster });
   const master = guard.masterName();
   const WAIT_MS = o.cleanupWaitMs ?? 30_000;
 
@@ -150,8 +166,10 @@ export async function createIsolation(o: IsolationOptions): Promise<Isolation> {
     process.off('SIGINT', onSignal);
     process.off('SIGTERM', onSignal);
   };
-  process.on('SIGINT', onSignal);
-  process.on('SIGTERM', onSignal);
+  if (o.manageSignals !== false) {
+    process.on('SIGINT', onSignal);
+    process.on('SIGTERM', onSignal);
+  }
 
   let admin: Db | undefined;
   let ready = false;
@@ -168,7 +186,7 @@ export async function createIsolation(o: IsolationOptions): Promise<Isolation> {
       }
     }
     await sweepStale(admin, guard.sourceDb, guard.token);
-    const created = await makeMaster(guard, admin, master, owner, o, notes);
+    const created = o.emptyMaster ? await makeEmptyMaster(guard, admin, master, owner) : await makeMaster(guard, admin, master, owner, o, notes);
     if (!created.ok) {
       throw new Error(
         `Could not copy the database: ${created.reason}\n` +
@@ -177,21 +195,38 @@ export async function createIsolation(o: IsolationOptions): Promise<Isolation> {
       );
     }
     const masterUrl = withDatabase(o.sourceUrl, master);
-    if (o.isolateNetwork !== false) {
+    // Switch outbound HTTP off in the master. In build mode this runs AFTER the build, because the net and http
+    // functions only exist once the files or the dump have installed them. It also runs between the files (see below).
+    const isolate = async (): Promise<ReturnType<typeof isolateNetwork> | undefined> => {
+      if (o.isolateNetwork === false) return undefined;
       const m = await guard.connect(withDatabase(o.adminUrl ?? o.sourceUrl, master));
       try {
-        const r = await isolateNetwork(m);
-        notes.push(
-          r.replaced.length
-            ? `Outbound HTTP is switched off in the copies: ${r.replaced.length} function(s) (${r.replaced.slice(0, 6).join(', ')}${r.replaced.length > 6 ? ', ...' : ''}) do nothing there.`
-            : 'Outbound HTTP is switched off in the copies: no pg_net or http functions were found.'
-        );
-        if (r.remaining.length) {
-          notes.push(`Not switched off: ${r.remaining.join(', ')} can still open connections from a copy.`);
-        }
+        return await isolateNetwork(m);
       } finally {
         await m.end().catch(() => {});
       }
+    };
+    if (o.build) await o.build(masterUrl, guard, async () => void (await isolate()));
+    const r = await isolate();
+    if (r) {
+      notes.push(
+        r.replaced.length
+          ? `Outbound HTTP is switched off in the copies: ${r.replaced.length} function(s) (${r.replaced.slice(0, 6).join(', ')}${r.replaced.length > 6 ? ', ...' : ''}) do nothing there.`
+          : 'Outbound HTTP is switched off in the copies: no pg_net or http functions were found.'
+      );
+      if (r.remaining.length) notes.push(`Not switched off: ${r.remaining.join(', ')} can still open connections from a copy.`);
+    }
+    if (o.build && o.verifyMaster) await o.verifyMaster(masterUrl);
+    // Masking comes before everything else that reads or copies the master: pgTAP, the baseline and every break copy.
+    let masked: MaskedColumn[] = [];
+    if (o.masks?.length) {
+      const m = await guard.connect(withDatabase(o.adminUrl ?? o.sourceUrl, master));
+      try {
+        masked = await applyMasks(m, o.masks);
+      } finally {
+        await m.end().catch(() => {});
+      }
+      notes.push(`Masked ${masked.length} column(s) in the first copy before any break ran: ${masked.map((c) => `${c.column} (${c.rows} row(s))`).join(', ')}.`);
     }
     if (o.prepareMaster) await o.prepareMaster(masterUrl);
 
@@ -218,8 +253,9 @@ export async function createIsolation(o: IsolationOptions): Promise<Isolation> {
 
     ready = true;
     return {
-      mode: 'template',
+      mode: o.emptyMaster ? 'files' : 'template',
       notes,
+      masked,
       withBreak: (brk, fn) => withCopy(brk, fn),
       withPristine: (fn) => withCopy(null, fn),
       async dispose() {
@@ -264,6 +300,16 @@ async function assertSameServer(guard: Guard, sourceUrl: string, adminUrl: strin
 function hostPort(url: string): string {
   const u = new URL(url);
   return `${hostOf(url)}:${u.port || '5432'}`;
+}
+
+/** Build mode: an empty master from template0. Nothing is read from the source. */
+async function makeEmptyMaster(guard: Guard, admin: Db, master: string, owner: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+  try {
+    await guard.createCopy(admin, master, 'template0', owner);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, reason: (e as Error).message };
+  }
 }
 
 async function makeMaster(

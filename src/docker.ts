@@ -1,0 +1,223 @@
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { hostId } from './guard.js';
+
+/**
+ * The Docker guard. Sandbox mode starts a throwaway PostgreSQL container, and this file is the only place that runs
+ * `docker`. Like the database guard, it is an allowlist of the commands the tool itself sends: every call goes through
+ * checkDockerArgs BEFORE it runs, with no shell. A command that is not in the list is refused.
+ *
+ * The rules: the tool starts one container shape (loopback port, no mounts, no extra privileges, no host network),
+ * runs only pg_dump, psql and pg_isready inside it, and has ONE other shape: a pg_dump helper on the host network (see
+ * checkDumpHelper), used only when the caller has allowed it. The container that holds the copies never gets the host network, and removes only containers that carry its name and labels and that
+ * belong to this run, or to a dead process of this host.
+ */
+
+export const CONTAINER_PREFIX = 'rls-saboteur-sandbox-';
+export const LABEL_KEY = 'rls-saboteur.sandbox';
+export const LABEL_HOST = 'rls-saboteur.host';
+export const LABEL_PID = 'rls-saboteur.pid';
+export const LABEL_TOKEN = 'rls-saboteur.token';
+
+/**
+ * The shell script `docker exec` runs in the container to carry one TCP connection to the server inside it.
+ * When the client side ends (stdin closes), the script closes its end of the TCP connection too: it stops the reader and
+ * exits, so no copy of the socket is left open. Before, the reader (`cat <&3`) kept the socket open after stdin ended, and a
+ * session whose Terminate message was not delivered in time stayed connected for good. That kept the master template "in
+ * use" and failed the next CREATE DATABASE ... TEMPLATE on a Linux runner.
+ * The `wait` is not optional. The server is PID 1 in its container, so a child that outlives this shell is reparented to it,
+ * and the server treats a reaped child it does not know, killed by a signal, as a crashed backend and restarts every session.
+ */
+export const RELAY_SCRIPT = 'exec 3<>/dev/tcp/127.0.0.1/5432 || exit 1; cat <&3 & p=$!; cat >&3; kill $p 2>/dev/null; wait $p 2>/dev/null; exit 0';
+
+export function containerNameFor(host: string, pid: number, token: string): string {
+  return `${CONTAINER_PREFIX}${host}-${pid}-${token}`;
+}
+
+/** Suffix of the helper container that runs pg_dump on the host network (Linux, loopback-only source). */
+export const DUMP_HELPER_SUFFIX = '-dump';
+
+export interface ContainerName {
+  host: string;
+  pid: number;
+  token: string;
+}
+
+export function parseContainerName(name: string): ContainerName | null {
+  const m = /^rls-saboteur-sandbox-([0-9a-f]{12})-(\d{1,10})-([0-9a-f]{16})(?:-dump)?$/.exec(name);
+  return m ? { host: m[1], pid: Number(m[2]), token: m[3] } : null;
+}
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/**
+ * Pure rule: may this container be removed? Used by every removal.
+ * It must carry the tool's name AND labels, the labels must agree with the name, and it must be a container of this run,
+ * or one made by a dead process of this host. A container of another host, or of a live process, is never removed.
+ */
+export function removableContainer(
+  name: string,
+  labels: Record<string, string>,
+  token: string,
+  isAlive: (pid: number) => boolean = pidAlive,
+  host: string = hostId()
+): { ok: true } | { ok: false; why: string } {
+  const id = parseContainerName(name);
+  if (!id) return { ok: false, why: `"${name}" does not have the name of a sandbox container` };
+  if (labels[LABEL_KEY] !== '1') return { ok: false, why: `"${name}" has no ${LABEL_KEY} label` };
+  if (labels[LABEL_HOST] !== id.host || labels[LABEL_PID] !== String(id.pid) || labels[LABEL_TOKEN] !== id.token) {
+    return { ok: false, why: `"${name}" has labels that do not match its name` };
+  }
+  if (id.token === token && id.host === host) return { ok: true };
+  if (id.host === host && !isAlive(id.pid)) return { ok: true };
+  return { ok: false, why: `"${name}" was not made by this run, and is not a container of a dead process of this host` };
+}
+
+export class DockerGuardError extends Error {
+  constructor(message: string) {
+    super(`Refused by the Docker guard: ${message}`);
+    this.name = 'DockerGuardError';
+  }
+}
+
+/** Environment variable names the tool passes to `docker exec -e` (names only: the values never touch the command line). */
+const EXEC_ENV = new Set(['PGPASSWORD', 'PGOPTIONS', 'PGHOST', 'PGPORT', 'PGUSER', 'PGDATABASE']);
+const EXEC_PROGRAMS = new Set(['pg_dump', 'psql', 'pg_isready']);
+export const IMAGE_PATTERN = /^[a-z0-9][a-zA-Z0-9._\/:@-]{0,200}$/;
+
+/**
+ * Throws unless these docker arguments have one of the shapes the tool sends. `ownName` is the container of this run.
+ * Listing (`ps`) and `port`/`inspect` are reads. `rm` is checked again by removableContainer in the caller.
+ */
+export function checkDockerArgs(args: string[], ownName: string): void {
+  const [verb, ...rest] = args;
+  const same = (a: string[], b: string[]): boolean => a.length === b.length && a.every((x, i) => x === b[i]);
+  switch (verb) {
+    case 'run': {
+      if (rest[0] === '--rm' && rest[1] === '--name' && rest[2] === `${ownName}${DUMP_HELPER_SUFFIX}`) return checkDumpHelper(rest, ownName);
+      // docker run -d --rm --name N --label k=v x4 -e POSTGRES_PASSWORD -e POSTGRES_INITDB_ARGS
+      //   then either  -p 127.0.0.1::5432 --add-host host.docker.internal:host-gateway IMAGE   (rows come from a dump)
+      //   or           --network none IMAGE                                                    (files mode: no network at all)
+      const fixedHead = ['-d', '--rm', '--name'];
+      if (!same(rest.slice(0, 3), fixedHead)) break;
+      const name = rest[3];
+      if (name !== ownName || !parseContainerName(name)) break;
+      const id = parseContainerName(name)!;
+      const labels = rest.slice(4, 12);
+      const wantLabels = [
+        '--label', `${LABEL_KEY}=1`,
+        '--label', `${LABEL_HOST}=${id.host}`,
+        '--label', `${LABEL_PID}=${id.pid}`,
+        '--label', `${LABEL_TOKEN}=${id.token}`
+      ];
+      if (!same(labels, wantLabels)) break;
+      const tail = rest.slice(12);
+      const common = ['-e', 'POSTGRES_PASSWORD', '-e', 'POSTGRES_INITDB_ARGS'];
+      if (!same(tail.slice(0, 4), common)) break;
+      const bridge = ['-p', '127.0.0.1::5432', '--add-host', 'host.docker.internal:host-gateway'];
+      const none = ['--network', 'none'];
+      const mode = tail[4] === '--network' ? none : bridge;
+      if (!same(tail.slice(4, 4 + mode.length), mode)) break;
+      const image = tail[4 + mode.length];
+      if (tail.length !== 4 + mode.length + 1 || !image || image.startsWith('-') || !IMAGE_PATTERN.test(image)) break;
+      return;
+    }
+    case 'port':
+      if (same(rest, [ownName, '5432/tcp'])) return;
+      break;
+    case 'inspect':
+      if (rest.length === 3 && rest[0] === '--format' && rest[1] === '{{.State.Running}}' && parseContainerName(rest[2])) return;
+      break;
+    case 'ps':
+      if (same(rest, ['-a', '--filter', `label=${LABEL_KEY}=1`, '--format', `{{.Names}}\t{{.Label "${LABEL_HOST}"}}\t{{.Label "${LABEL_PID}"}}\t{{.Label "${LABEL_TOKEN}"}}\t{{.Label "${LABEL_KEY}"}}`])) return;
+      break;
+    case 'rm':
+      // -v removes the anonymous volume of the image. Only a name of the tool's shape.
+      if (rest.length === 3 && rest[0] === '-f' && rest[1] === '-v' && parseContainerName(rest[2])) return;
+      break;
+    case 'exec': {
+      // docker exec [-i] [-e VAR]... NAME program args...
+      let i = 0;
+      if (rest[i] === '-i') i++;
+      while (rest[i] === '-e') {
+        if (!EXEC_ENV.has(rest[i + 1] ?? '')) throw new DockerGuardError(`exec may not pass the variable "${rest[i + 1]}"`);
+        i += 2;
+      }
+      if (rest[i] !== ownName) break;
+      const program = rest[i + 1];
+      if (program === 'bash') {
+        // The one shell command the tool sends: the relay that carries a TCP connection to the server in the container.
+        if (same(rest.slice(i + 1), ['bash', '-c', RELAY_SCRIPT]) && i === 1) return; // exactly: exec -i NAME bash -c SCRIPT
+        throw new DockerGuardError('exec may run bash only with the relay script');
+      }
+      if (!program || !EXEC_PROGRAMS.has(program)) throw new DockerGuardError(`exec may run only ${[...EXEC_PROGRAMS].join(', ')}, not "${program}"`);
+      return;
+    }
+  }
+  throw new DockerGuardError(`this docker command is not one the tool sends: docker ${args.slice(0, 3).join(' ')}${args.length > 3 ? ' ...' : ''}`);
+}
+
+/**
+ * The second container shape. On Docker Engine for Linux a container on the bridge cannot reach a database that listens on
+ * 127.0.0.1 of the host. For that one case only, pg_dump runs in a helper container on the host network, and its output is
+ * piped into the sandbox. The helper holds no password of its own, runs nothing but pg_dump (set as the entrypoint) with a fixed set of options, is
+ * labelled like the sandbox so the sweep and the watchdog cover it, and is removed when it ends (--rm).
+ *   docker run --rm --name NAME-dump --label x4 --network host -e PGPASSWORD -e PGOPTIONS -e PGHOST -e PGPORT -e PGUSER
+ *     -e PGDATABASE --entrypoint pg_dump IMAGE [--no-publications] [--no-subscriptions] [--no-tablespaces] [--schema=NAME]...
+ */
+function checkDumpHelper(rest: string[], ownName: string): void {
+  const same = (a: string[], b: string[]): boolean => a.length === b.length && a.every((x, i) => x === b[i]);
+  const id = parseContainerName(ownName);
+  if (!id) throw new DockerGuardError('the dump helper needs a sandbox container name');
+  const head = ['--rm', '--name', `${ownName}${DUMP_HELPER_SUFFIX}`, '--label', `${LABEL_KEY}=1`, '--label', `${LABEL_HOST}=${id.host}`, '--label', `${LABEL_PID}=${id.pid}`, '--label', `${LABEL_TOKEN}=${id.token}`, '--network', 'host'];
+  const env = ['PGPASSWORD', 'PGOPTIONS', 'PGHOST', 'PGPORT', 'PGUSER', 'PGDATABASE'].flatMap((v) => ['-e', v]);
+  const want = [...head, ...env];
+  if (!same(rest.slice(0, want.length), want)) throw new DockerGuardError('the dump helper has a shape the tool does not send');
+  // The image's own entrypoint script must not run on the host network: pg_dump is the entrypoint, not a command after it.
+  const entry = rest.slice(want.length, want.length + 2);
+  if (!same(entry, ['--entrypoint', 'pg_dump'])) throw new DockerGuardError('the dump helper must replace the image entrypoint with pg_dump');
+  const image = rest[want.length + 2];
+  if (!image || image.startsWith('-') || !IMAGE_PATTERN.test(image)) throw new DockerGuardError('the dump helper image is not a plain image name');
+  const fixed = new Set(['--no-publications', '--no-subscriptions', '--no-tablespaces']);
+  for (const a of rest.slice(want.length + 3)) {
+    if (!fixed.has(a) && !/^--schema=[^\s\u0000]+$/.test(a)) throw new DockerGuardError(`the dump helper may not pass "${a.slice(0, 20)}" to pg_dump`);
+  }
+}
+
+export interface DockerResult {
+  code: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+/** Runs `docker` with a checked argument list and no shell. `env` is merged over the process environment. */
+export function docker(args: string[], ownName: string, env: Record<string, string> = {}, timeoutMs = 120_000): DockerResult {
+  checkDockerArgs(args, ownName);
+  const r = spawnSync('docker', args, { encoding: 'utf8', env: { ...process.env, ...env }, timeout: timeoutMs, stdio: ['ignore', 'pipe', 'pipe'] });
+  return { code: r.status, stdout: r.stdout ?? '', stderr: (r.stderr ?? '') + (r.error ? String(r.error.message) : '') };
+}
+
+/** A streaming docker exec, for the dump pipe. The same check applies. */
+export function dockerSpawn(args: string[], ownName: string, env: Record<string, string> = {}): ChildProcess {
+  checkDockerArgs(args, ownName);
+  return spawn('docker', args, { env: { ...process.env, ...env }, stdio: ['pipe', 'pipe', 'pipe'] });
+}
+
+/**
+ * Starts a detached watchdog that removes the container when this process is gone (including kill -9) or when the
+ * container is gone already. The script is fixed text; the name must have the tool's shape.
+ */
+export function startWatchdog(name: string, pid: number): void {
+  if (!parseContainerName(name)) throw new DockerGuardError('watchdog: bad container name');
+  const script =
+    'while kill -0 "$1" 2>/dev/null && docker inspect --format "{{.State.Running}}" "$2" >/dev/null 2>&1; do sleep 2; done; ' +
+    'docker rm -f -v "$2" >/dev/null 2>&1';
+  const child = spawn('sh', ['-c', script, 'sh', String(pid), name], { detached: true, stdio: 'ignore' });
+  child.unref();
+}

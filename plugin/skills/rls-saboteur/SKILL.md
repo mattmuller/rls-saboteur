@@ -22,7 +22,7 @@ Passing RLS tests prove little unless they fail when a policy breaks. RLS Sabote
 3. After the yes, run `npx rls-saboteur --yes --json-file saboteur-report.json` from the project root (add `--close-sessions` only as above).
 4. Read the exit code: 0 all caught, 1 misses or a failed check, 2 could not check.
 
-Options you may need: `--test "<cmd>"` for a custom test command, `--schemas a,b`, `--jobs 4`, `--only-related`, `--dry-run` to list the breaks, `--checks-only` for the checks that need no tests.
+Options you may need: `--sandbox` (run the copies in a throwaway Docker container instead of on the user's server; ask first, it starts a container and, without `--from-files`, streams the rows into it), `--from-files` (needs `--sandbox`; build the copies from `supabase/migrations` and `supabase/seed.sql` so no real row is read), `--mask schema.table.column` (scramble a column before any break runs; the run stops if it cannot), `--test "<cmd>"` for a custom test command, `--schemas a,b`, `--jobs 4`, `--only-related`, `--dry-run` to list the breaks, `--checks-only` for the checks that need no tests.
 
 The tool refuses a non-local database. Never pass `--allow-remote-i-understand-this-locks-tables` on the user's behalf.
 

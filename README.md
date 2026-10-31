@@ -48,6 +48,19 @@ These are the guarantees. Each names the tests that check it, by their exact nam
 - **Outbound HTTP from a copy is switched off** unless you pass `--no-isolate-network`. In the copies, never in your database, every function of schema `net` and of the `pg_net` and `http` extensions keeps its signature and does nothing, so triggers and database webhooks cannot call out. Proof: `E: outbound HTTP from the copy is switched off` (matrix).
 - **Names from the database are never printed raw.** Control characters, escape sequences, bidirectional overrides, line and paragraph separators and zero-width characters in policy, table, role and function names, expressions and test output are written out visibly (`\x1b`) in the console and the Markdown report. Proof: `G: visible()` (unit) and `an escape sequence in a policy name never reaches the console or the report as a control character` (matrix).
 - **A bad value is never a default.** `--threshold` outside 0 to 100, `--jobs` below 1 or not whole, a bad `--timeout`, `--max-size` or `--runner` exit 2. A run in which no break was decided (none run, all skipped, all errored) exits 2, not 0. Proof: `H1: option values`, `H1: a run that decided nothing is not a pass`, `6: --runner is checked` (unit) and `H1: values are checked, and a run that checked nothing is not a pass` (matrix).
+- **A new mode needs the same guarantees.** The empty master that `--from-files` and `--sandbox` use is allowed in build mode only, for the master only, and never from anything but `template0`. Proof: `empty-master: the guard refuses a master made from template0 unless build mode is on` and `empty-master: build mode allows template0 for the master only, and no other template` (unit).
+- **Every `docker` command is on an allowlist.** One container shape for the copies, no privilege, no mount, no host network, a loopback port. The one exception is a short-lived `pg_dump` helper, which the plan announces and which can use the host network on Linux; `exec` runs only `pg_dump`, `psql` and `pg_isready`; every other verb is refused. Proof: `docker guard: allows the one container shape the tool starts`, `docker guard: refuses privileges, mounts, host network and a published port beyond loopback`, `docker guard: exec runs only pg_dump, psql and pg_isready in its own container`, `docker guard: refuses every other verb, and a removal of a name that is not the tool's` (unit).
+- **Only the tool's own containers are removed.** Proof: `removableContainer (the one rule behind every container removal)` (unit) and, in the matrix, `sandbox-sweep: the next run removes the container of a dead process, and no other`.
+- **A sandbox container does not outlive the run.** Proof, in the matrix: `sandbox-files: the copies are built in a container from the files, and the container and its volume are gone afterwards`, `sandbox-kill9: a run killed with SIGKILL leaves no container behind`, `sandbox-sigint: SIGINT removes the container and exits 130` and `sandbox-sigterm: SIGTERM removes the container and exits 143`.
+- **`--from-files` runs only in a sandbox.** Proof: `files-need-sandbox: --from-files without --sandbox exits 2 and creates nothing` (matrix).
+- **No real row reaches a copy built from files.** Proof: `sandbox-files` (a source with marked rows; the copies show only the seed rows).
+- **Outbound HTTP is switched off after the build and after every file.** Proof: `sandbox-net: a migration that creates net.http_post is neutralised, and the seed cannot call it` (matrix).
+- **The dump session is read-only and fires no trigger.** Proof: `sandbox-dump-readonly: the dump session asks the server to refuse writes, and names the container host` (unit) and `sandbox-dump: the rows are streamed into the container, masked there, and the source is unchanged` (matrix, which compares the source before and after).
+- **A Supabase project runs on the Supabase image.** Proof, in the matrix when `SABOTEUR_MATRIX_SUPABASE_IMAGE` is set (CI pulls the public image for the PostgreSQL 17 run, so these tests run there; the 16 run skips them): `sandbox-supabase-files: a Supabase project runs on the Supabase image from its migrations and seed, with real pgTAP, and the image is made to ask for a password`, `sandbox-supabase-files-rows: only the seed reaches the copies` and `sandbox-supabase-dump: the source is dumped onto the image's own database, masked, with foreign keys to auth.users kept`; unit: `sandbox-fk: only foreign keys that point outside the dumped schemas become NOT VALID`.
+- **A `--from-files` container has no network.** Proof: `sandbox-isolated: in --from-files mode a migration cannot reach the host or the internet, and no port is published` (matrix) and `docker guard: the files shape has no network at all, and nothing else is accepted in its place` (unit).
+- **Masking reaches every table below the masked one.** Proof: `mask-inherit: rows, statistics and files of inheritance children and partitions are cleaned too` (matrix), and `mask-inherit: every table below the masked one is vacuumed and has its statistics checked`, `mask-inherit: an original value in the statistics of a child stops the run` and `mask-inherit: a foreign table below the masked one stops the run before anything is rewritten` (unit), `mask-multi-parent: a table with a parent outside the masked tree stops the run before any copy`, `mask-copiers: a materialized view or an update rule over the masked table stops the run before any copy` and `mask-fk: a column tied to a masked column by a foreign key must be masked in the same run` (matrix), the unit tests `mask-inherit: a member with a parent outside the tree stops the run`, `mask-copiers: an update rule or a materialized view over the table stops the run` and `mask-fk: a column tied to the masked one by a foreign key must be masked in the same run`, and `mask-child-refused: masking a child table on its own exits 2 before anything is copied` (matrix) and `mask-inherit: a table that has a parent cannot be masked on its own, and the plan check says so` (unit).
+- **Role names cannot change the role script.** Names with `$`, a backslash or a line break are refused, and the script tag is random per run. Proof: `sandbox-role-names: a name with $, a backslash or a line break is refused, and the tag changes every time` (unit).
+- **Masking fails closed, and the database confirms it.** Proof: `mask-closed: a column that does not exist stops the run`, `mask-closed: a row that was not rewritten stops the run and rolls back`, `mask-closed: an original value that survives stops the run and rolls back`, `mask-closed: a role that cannot switch triggers off stops the run`, `mask-closed: a type scramble cannot handle, a view and a generated column stop the run`, `mask-stats: an original value still in the planner statistics stops the run` (unit); `mask-db: every masked value is different in the database afterwards, and the shape survives` (matrix; it reads the table, `pg_stats`, `pg_stats_ext` and the data files before and after), `mask-run: the first copy is masked before the baseline, and the same value masks the same way in two tables`, `mask-missing-column: a named column that does not exist exits 2 before anything is copied or run` and `mask-failure: a rewrite that fails after the copy exists stops the run before any test and removes the copy` (matrix).
 - **A crash cannot leave your database changed.** There is nothing to undo. Proof: `crash-during-first-copy: kill -9 mid-copy leaves the source open and unchanged` (matrix).
 - **It never runs without asking, unless you say `--yes`.** Proof: `confirmation steps` (test/confirm.test.ts), `run asks before it copies anything` (test/run-confirm.test.ts) and `no-prompt-without-yes: a run with no terminal and no --yes exits 2 and makes no copy` (matrix).
 
@@ -201,6 +214,129 @@ If no copy can be made, it stops with exit 2 and your database is untouched. Pas
 
 On the demo project, 42 breaks took about 35 seconds on copies with `--jobs 2`.
 
+## Sandbox, schema and seed only, and masking
+
+Three options change where the copies live and what they hold. None of them changes the default. Without these flags, the tool sends the same statements as 0.2.1.
+
+| You want | Pass |
+|---|---|
+| No copy on the server that holds your database | `--sandbox` |
+| No real row read at all | `--sandbox --from-files` |
+| Chosen columns scrambled in the first copy | `--mask schema.table.column` (repeat it) |
+
+The three combine. `--from-files` always needs `--sandbox`.
+
+### Sandbox: `--sandbox`
+
+The copies live in a throwaway PostgreSQL container, not on the server that holds your database. The tool starts the container, builds the master template in it, makes every break copy in it, runs your tests against it and removes it. It needs a running Docker.
+
+```sh
+npx rls-saboteur --sandbox
+npx rls-saboteur --sandbox --sandbox-image my-registry/postgres-with-pgtap:17
+```
+
+- **What it changes.** Nothing is created on your server, nothing there is locked, and no session on it is ever closed. A busy local Supabase needs no `--close-sessions` and no `--admin-url`. A source over 2 GB still needs `--max-size` when rows are streamed in.
+- **What it does not change.** The copies still hold files. The container's storage is deleted with the container. On Linux that storage is on the same machine as Docker, so "no copy on your machine" is true of your database server, not of the disk. On Docker Desktop it is inside the Docker VM.
+- **How the rows get in.** Without `--from-files`, the tool runs `pg_dump` inside the container, against your database, in a session that the server holds read-only (`PGOPTIONS=-c default_transaction_read_only=on`), and loads the result with `psql`. Roles are created first from `pg_roles` (no superuser, no password). `pg_dump` creates triggers after it loads the data, so no trigger fires during the load. The rows pass through the Docker client as a stream and are not stored outside the container.
+- **The image.** The default is `postgres:<major version of your database>` from Docker Hub, pulled if it is not here. That image has no pgTAP and none of the Supabase roles, schemas or extensions. Pass `--sandbox-image` for an image that has what your tests need. **The Supabase Postgres image works** (tested with `public.ecr.aws/supabase/postgres:17.6.1.011`, see "Supabase projects" below).
+- **`--sandbox-image` runs an image you name.** Treat it like any command you run.
+- **Reaching your database from the container.** The container reaches a source on `127.0.0.1` through `host.docker.internal`. Docker Desktop forwards that name to the loopback of your machine. Docker Engine for Linux does not: the name is the bridge gateway, and a service bound to `127.0.0.1` refuses a connection that arrives there (seen on a GitHub Actions runner: `pg_dump: connection to server at "host.docker.internal" ... Connection refused`). So before the dump the tool runs `pg_isready` inside the container. Only exit code 2 (no response) counts as "cannot reach"; any other failure, a Docker error included, stops the run and never changes the network. On exit 2, `pg_dump` runs in a SECOND container on the HOST network (`docker run --rm --network host --entrypoint pg_dump`, labelled like the sandbox, removed with it), and its output is piped into the sandbox. **That is a real escalation:** a container on the host network can reach every service on your machine's loopback, not only your database. So it is limited. The plan names it before you confirm, and the report notes when it happened. It happens on its own only for the default `postgres:<major>` image. For an image you chose with `--sandbox-image` it needs `--sandbox-host-network`; without that flag the run stops with a message. The entrypoint is forced to `pg_dump`, so the image's own entrypoint script never runs on the host network, and the docker allowlist refuses any other command or option for that container. The container that holds the copies never has the host network. A source published on `0.0.0.0` is reached directly and needs no helper. Proof: `sandbox-dump` and the two tests after it, on Linux in CI against a source published on `127.0.0.1` only; unit: `docker guard: the dump helper runs only pg_dump, on the host network, with the tool's labels`, `docker guard: the container that holds the copies never gets the host network`, `host network is chosen only by pg_isready exit 2, and only when allowed`, `host network for pg_dump is automatic for the default image only` and `the plan says that pg_dump may run on the host network`.
+- **Safety.** There are two container shapes. With a dump, the container sits on the default Docker network and publishes one port on `127.0.0.1` only. With `--from-files`, it has no network at all (`--network none`) and no published port (see below). Either way: a random password, no mount, no privilege, and the sandbox container never has the host network. (One exception, on Linux only, announced in the plan: when the container cannot reach a source on loopback, `pg_dump` runs in a separate helper container on the host network, see "Reaching your database from the container".) Every `docker` call goes through one allowlist (`src/docker.ts`), like the database guard. It starts those two shapes and the dump helper, runs only `pg_dump`, `psql`, `pg_isready` and one fixed relay script inside the container, and removes only containers that carry the tool's name and labels and belong to this run, or to a dead process of this host.
+- **A password is always needed.** The container starts with `POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256` and a random password, and the relay accepts at most 64 connections at once. Some images ignore that: the Supabase image has its own `pg_hba.conf` that trusts `127.0.0.1` and `::1`. So the tool then REPLACES the image's `pg_hba.conf` with two lines (`local all all trust`, `host all all all scram-sha-256`; the unix socket is reachable only inside the container), reloads the server, and checks the result instead of trusting the write. It makes two logins that must be refused as a password failure (SQLSTATE `28P01`): the right user with a wrong password on `postgres`, and a random user that does not exist on `template1`. Any other error, a refused connection or "role does not exist" included, is not a refusal and stops the run. As superuser it also reads `pg_hba_file_rules` and stops the run if any `host` rule uses a method that needs no password (anything except `scram-sha-256`, `md5`, `password` and `reject`). It repeats the checks after your migration files or the dump have run, because they run as superuser and could loosen `pg_hba.conf`. If the file cannot be replaced, the checks fail and the run exits 2. Proof: `sandbox-auth-relay: a wrong password through the relay is refused, and the right one is accepted`, `sandbox-auth-trust: an image with a passwordless host rule (loopback) whose pg_hba.conf cannot be replaced stops the run with exit 2 and leaves no container` and the same test for `(one database)` (a read-only `pg_hba.conf`: the replacement fails and the run stops), `sandbox-auth-after-build: a migration that loosens pg_hba.conf stops the run before any copy` and `sandbox-supabase-files` (matrix; with the replacement removed the Supabase run exits 2 with "lets a client in without the right password"); `sandbox-auth: only a password refusal counts as a refusal, and both probes must be refused`, `sandbox-auth-rules: a host rule that needs no password stops the run` and `sandbox-hba: the file the tool writes trusts only the socket and asks for a password on every host line` (unit).
+- **What the container can reach.** With a dump, the container can reach your machine and the internet, because `pg_dump` runs in it and must reach your database. Nothing of yours runs there except the SQL restored from your own database, with the triggers created after the data, so none fires. With `--from-files`, it has no route to your machine or the internet. See "Schema and seed only".
+- **A run that dies.** Ctrl-C and SIGTERM remove the container before the tool exits (130 and 143), including during the image pull and start-up. After `kill -9`, a detached watchdog removes the container within a few seconds. The next run also removes any container of this host whose process is dead, and never one of a live process or another host. If a removal fails, the tool prints `docker rm -f -v <name>`.
+
+### Supabase projects
+
+The Supabase Postgres image works in sandbox mode. Tested end to end with `public.ecr.aws/supabase/postgres:17.6.1.011` on a Supabase-shaped project (`test/modes/supabase-project`: `auth.uid()` policies, a `SECURITY DEFINER` helper, foreign keys to `auth.users`, `supabase/migrations`, a seed and a pgTAP file).
+
+```sh
+npx rls-saboteur --sandbox --sandbox-image public.ecr.aws/supabase/postgres:17.6.1.011 --from-files
+npx rls-saboteur --sandbox --sandbox-image public.ecr.aws/supabase/postgres:17.6.1.011 --mask public.profiles.email
+```
+
+On Linux, the second form (a dump from a database on `127.0.0.1`) also needs `--sandbox-host-network`, because you chose the image. See "Reaching your database from the container".
+
+- **Authentication.** The image's own `pg_hba.conf` trusts loopback. The tool replaces it and proves it held (see "A password is always needed").
+- **The managed database.** The image ships a `postgres` database with the schemas `auth`, `storage`, `realtime`, `vault`, `extensions` and `graphql`. With `--from-files`, and with a dump from an image that has them, the master is a CLONE of that database, so `auth.uid()`, `auth.users` and the roles are there when your migrations run. The image's own workers (`pg_cron`, `pg_net`) keep sessions open on that database; the tool closes them for a moment inside the container to take the clone. The container is the tool's own, so this changes nothing of yours.
+- **A dump of a Supabase database** loads only the schemas you cover (`--schemas`, default `public`) onto that clone, because a dump of a whole Supabase database does not restore (the `graphql_public` functions are made by event triggers). So `auth.users` is empty in the copies. Foreign keys from your schemas to tables in other schemas (`auth.users`) are created `NOT VALID`: existing rows are not checked against the empty table, new rows still are. A pgTAP test that inserts a row for a user that is not in the copy fails like it would in a real database. Masking `auth.users.email` in this mode masks 0 rows, and the report says so.
+- **Roles and extensions.** The Supabase roles (`anon`, `authenticated`, `service_role`, `supabase_admin` and the rest) are in the image. Extensions checked by running a migration with `create extension` in a `--from-files` sandbox on the image: `supabase_vault`, `pg_net`, `pgsodium` (in its own schema `pgsodium`; with `with schema extensions` it refuses), `pgcrypto`, `uuid-ossp`, `pg_graphql`, `pgjwt` and `http` all work. `pg_cron` does not (see "pg_cron"). Output: `real-runs/13-supabase-extensions.log` in the release evidence.
+- **Not supported.** `supabase test db` (see "Runners"). A dump of a Supabase database does not copy `auth.users`, `storage.objects` or other managed data; use `--from-files` and a seed for those.
+
+### Schema and seed only: `--from-files`
+
+Each copy is built from your files instead of cloning your database. The tool reads `supabase/migrations/*.sql` in name order, then `supabase/seed.sql`. No row of your database is read. Pass `--migrations-dir` and `--seed-file` for other places. A missing default seed file means empty tables.
+
+```sh
+npx rls-saboteur --sandbox --from-files
+```
+
+- **It needs `--sandbox`.** Migration and seed files are your code. On your own server they would run with the rights of your database user and could change roles or other databases there. In the container they can only reach the container (see below). Without `--sandbox` the run exits 2. A restricted role on your own server was considered and not built, because this release did not prove one sound.
+- **What the files can reach.** With `--from-files`, the container runs with `docker run --network none`. It has no route at all and no IPv4 address except loopback (Linux still lists a few fallback tunnel devices in a new network namespace, all down and without an address), no `host.docker.internal` name, no route to your machine, the Docker bridge gateway, other containers or the internet, and it publishes no port. This tool reaches its Postgres through `docker exec`: a relay on `127.0.0.1` on your side carries each connection into the container. An internal Docker network was tried first. It was not used: Docker ignores a published port on it, and this release did not prove that it blocks the container's own bridge gateway, which `--network none` does by having no route. Proof: `sandbox-isolated: in --from-files mode a migration cannot reach the host or the internet, and no port is published` runs a migration that tries a TCP connection to the host name, to the Docker bridge gateway, to loopback on the host's Postgres port and to `1.1.1.1`, from inside the container with `COPY ... FROM PROGRAM`. All four are blocked, the routing table is empty, and the only IPv4 addresses are `127.x`. The same test checks `NetworkMode` is `none`, there are no port bindings and no extra host entry, and that the same probe on the default network does connect (so the test can fail). This was tested on Docker Desktop for Mac and on a real Linux Docker Engine (see "Linux" below).
+- **What the files can still do.** They run as the superuser of the container's Postgres, so they can run programs as the container's `postgres` user, read the container's files and use the container's CPU, memory and disk. They cannot reach anything outside it. Outbound HTTP functions (`net`, `pg_net`, `http`) are also switched off after every file, as a second layer.
+- **Runners.** In sandbox mode use `--runner psql` (it is the default with `--sandbox`) or `--test`. The Supabase CLI runner (`supabase test db`) does not work: it runs `pg_prove` in its own Docker container, and on Docker Desktop for Mac that container got "connection refused" on the sandbox, in files mode (the relay is a process on your machine) and in dump mode (a published port). The same refusal happened against a plain container with a random published port, without this tool. `--runner supabase` with `--sandbox` exits 2 before anything starts. Proof: `sandbox-supabase-runner: --runner supabase with --sandbox is refused before anything starts` (matrix).
+- **The policies must match.** Breaks are generated from the policies of your database. After the build, the tool compares the policies of the copy with the policies of your database. If any differ, the run exits 2 and names them, before any test runs.
+- **Your database is still read for its catalogue**, as before: policies, tables, columns and roles. No user table is selected from.
+- **Roles.** The files must create the roles they use, or the image must have them. A role the files do not create stops the build with the server's message.
+
+### Linux
+
+What is proven, and where:
+
+- **Docker Engine installed directly on a host (GitHub Actions `ubuntu-latest`, PostgreSQL 16 and 17).** The whole matrix runs there on every push: `--from-files` end to end, the network probe, the relay, dump mode against a source published on `127.0.0.1` only, masking, the sweep, signals. On the 17 run the four Supabase tests run too, on the public Supabase image. See `.github/workflows/ci.yml`.
+- **A `docker:dind` container (Alpine, Engine 29.9.2) as the Docker host through `DOCKER_HOST`**, by hand, before the CI run existed: `--from-files` with `postgres:17`, and the network probe. It showed that `--network none` blocks `1.1.1.1`, the bridge gateway and loopback with an empty routing table, and that an internal Docker network (`docker network create --internal`) reached its own gateway on the engine host (`172.19.0.1:2375`, the engine's API port). That is why `--network none` is used and an internal network is not.
+- **Docker Desktop for Mac** (Docker 29.9.2): the whole matrix, on PostgreSQL 16 and 17, with the Supabase tests.
+
+Three things only Linux CI found in 0.3.0, all fixed:
+
+- A source on `127.0.0.1` could not be dumped, because `host.docker.internal` does not reach loopback on Linux Engine. Fixed by the host-network `pg_dump` helper, which is limited and announced (see "Reaching your database from the container"). The CI tests that use a chosen image pass `--sandbox-host-network`.
+- A client of the relay that disappeared without the closing message left its session open in the container for good, because the relay's reader kept the socket after the writer had ended. That kept the master copy "in use" and failed the next `CREATE DATABASE ... TEMPLATE`. The relay script now closes its end of the connection when its input ends. Proof: `sandbox-relay-no-leak`.
+- The `sandbox-isolated` control assumed Docker Desktop. It tried to connect from the default network to the loopback-only test database, which Linux Engine refuses, so the control could not show that the probe works. It now connects to a listener on all interfaces, which both engines allow.
+
+Not tested: Windows; Podman or rootless Docker; a Linux engine behind a firewall that drops traffic from the bridge to the host (the dump helper uses the host network, but a source on a non-loopback address still goes through the bridge); `--sandbox` with the Supabase image against a source on loopback on Linux is covered only by the CI test `sandbox-supabase-dump`.
+
+### Masking: `--mask`
+
+```sh
+npx rls-saboteur --sandbox --mask public.users.email --mask public.users.full_name --mask public.users.notes=null
+```
+
+Or in `.rls-saboteur.json`: `"mask": ["public.users.email", "public.users.notes=null"]`.
+
+The columns are rewritten in the first copy (the master template), after it is built and before pgTAP, the baseline run or any break. Every later copy inherits them.
+
+- **Scramble** (the default) replaces a value with a hash of it and a random salt made for the run. The same input gives the same output in the whole run, so a masked e-mail on `orders` still matches the masked e-mail on `users` when you mask both. `NULL` stays `NULL`. Unique constraints and `varchar(n)` limits hold. It handles `text`, `varchar`, `char`, `citext`, `name`, `uuid`, `smallint`, `integer` and `bigint`. `=null` sets the column to `NULL` and works for every type of column that accepts `NULL`.
+- **It fails closed.** The run stops, with exit 2 and no test run, when: a named column does not exist (checked against your database before anything is copied, and again on the copy), a name is not a plain table column (a view or a generated column), the type cannot be scrambled, the rewrite raises an error, a row was not rewritten, an original value is still in the column, or an original value is still in the planner statistics. The role must be able to switch triggers off (`session_replication_role = replica`), which needs a superuser. Row security is off for the rewrite, so a policy cannot hide a row from it.
+- **Old values are removed from the files.** After each column, the tool runs `VACUUM FULL` and `ANALYZE` on the table and on every inheritance child and partition (found through `pg_inherits`), and `VACUUM FULL` on `pg_statistic` and `pg_statistic_ext_data`, so dead rows, index pages and `pg_statistic` no longer hold the originals, and then asks `pg_stats`, `pg_stats_ext` and `pg_stats_ext_exprs` whether any original value is left.
+- **What masking is, and is not.** Masking covers the cases stated above and tested by the tests named in this section. It rewrites the columns you name. It cannot find a value that was copied somewhere else, and it does not scan. It is not an anonymisation guarantee and not a privacy control: do not use it to make real personal data safe to share. If no real row may be read, use `--from-files`.
+- **What masking does not cover.**
+  - Values copied into other tables or columns by your own code: a denormalised copy, an audit or history table filled by an old trigger or job, a log, a search index kept as a table, a cache table, a column made by `CREATE TABLE AS`, or an extension that stores its own copy. Only the cases listed above are detected.
+  - Free text. An e-mail address typed into a notes column, a name inside a comment, or a value inside a JSON, XML or array column is not found or changed. A column of such a type cannot be scrambled; `=null` clears the whole column.
+  - Only the named columns, and the tables below them. Inheritance children and partitions of a masked table are rewritten by the same `UPDATE`, so the tool vacuums each of them and checks the statistics of each. A foreign table below it stops the run, because the `UPDATE` would go to its server. A table that has a parent cannot be masked on its own, because the parent's statistics also hold its values: mask the root table, whose rewrite reaches every table below it. If a table below the root also inherits from a table outside the tree (multiple inheritance), the run stops too. An `UPDATE` rule on a table in the tree, or a materialized view that reads it (directly or through other views), would keep a copy of the originals, so the run stops for those as well. All of these exit 2 before anything is copied. A copy of a value in another column, an audit table, a JSON column or a function default stays as it was. Name those columns too.
+  - Triggers are switched off during the rewrite, so an audit trigger cannot copy the old value. That also switches off foreign key actions, so a column that a foreign key ties to a masked column would keep the original values. That holds in both directions (a column that references the masked one, and a column the masked one references) and along a chain of keys. The run stops (exit 2, before anything is copied) unless every linked column is masked in the same run too. The same input gives the same output, so the keys still match.
+  - The server that made the copy, and its write-ahead log and logs, may still hold the original values. In sandbox mode that server is the container, which is removed. In the default mode it is your own server.
+  - With `--sandbox` and no `--from-files`, real rows reach the container before they are masked. Use `--from-files` if no real row may be read.
+  - The tests run on masked data. A test that depends on a real value fails the baseline, and the run exits 2.
+  - Masking low-cardinality columns (a flag, a small number) can fail the check that no original value is left, because a scrambled value can equal an old one. Mask identifying text.
+
+### pg_cron
+
+Scheduled `pg_cron` jobs do not run in a copy. This was tested on a real server, not assumed. Tests: `pg-cron-copies: a job scheduled in the source keeps running there and never runs in a copy` (the matrix, PostgreSQL 16 and 17, with `pg_cron` preloaded) and the manual run below.
+
+- The `pg_cron` scheduler reads `cron.job` only in the database named by `cron.database_name` (default `postgres`). A copy has a different name, so its `cron.job` rows are copied and inert. A job registered inside a copy never runs either.
+- A job fires in a copy only if a job in the cron database names that copy in its `database` column. Copy names are random for every run, so no existing job can name one. (Shown by scheduling such a job on purpose: it did fire. That needs a job written against the copy's name, which the tool never publishes.)
+- Jobs registered in your database keep running there, as they did before. The tool is read-only on it and does not pause them.
+- The scheduler keeps a connection to the cron database open. That is why the first copy of a stock local Supabase needs `--close-sessions` (see "The first copy and open connections").
+- **A build mode cannot create `pg_cron`.** `create extension pg_cron` is accepted only in the cron database, so it fails in the fresh database of a copy built from files or a dump. The run exits 2 and says so (observed on the Supabase image, before this release began to refuse that image). Use the default mode (a clone keeps the extension and its inert jobs) or keep `pg_cron` out of the files.
+
+## Ideas
+
+Planned, in no fixed order. Ideas and pull requests are welcome.
+
+- **A restricted role for `--from-files`**, so the files could run on your own server without a container.
+- **Block the container's network during the build**, so even a file that installs the extension and calls out in the same file is stopped.
+- **Windows.**
+
 ## Plain Postgres (no Supabase)
 
 Nothing in the tool needs Supabase. Without it you must say three things the Supabase defaults would have said for you:
@@ -257,6 +393,14 @@ A `FAIL` makes the exit code 1.
 --close-sessions      Approve closing other sessions on a local source for a moment, to take the first copy. Needs its own flag.
 --max-size <size>     Allow a source larger than 2GB (default limit 2GB), for example --max-size 5GB
 --no-isolate-network  Leave outbound HTTP on inside the copies (default: switched off)
+--sandbox             Run the copies in a throwaway Docker container instead of on your database server
+--sandbox-image <i>   Image for --sandbox. Default: postgres:<major version of your database>
+--sandbox-host-network  With --sandbox and a dump: allow pg_dump on the host network when the container cannot reach a database
+                        on 127.0.0.1 (Docker Engine for Linux). Automatic for the default image only.
+--from-files          With --sandbox: build the copies from supabase/migrations and supabase/seed.sql, so no real row is read
+--migrations-dir <d>  With --from-files: the migrations directory (default supabase/migrations)
+--seed-file <path>    With --from-files: the seed file (default supabase/seed.sql)
+--mask <col>          Scramble schema.table.column in the first copy (repeat it); col=null sets it to NULL. The run stops if it cannot.
 --filter <text>       Only breaks whose id contains this text
 --checks-only         Only the checks that need no tests
 --dry-run             List the breaks and stop
@@ -291,7 +435,7 @@ Every skip needs a written reason, and skipped breaks are listed in the report.
 - It never changes your database. It reads the catalogue, and your rows are copied into temporary databases on the same server, which are dropped afterwards. It runs your own tests on the copies.
 - Copies are named `saboteur_<host id>_<pid>_<run token>_<n>`, labelled, and dropped after each break. A run that dies leaves none behind that the next run does not sweep. A copy is swept only if its name or label says it was made by this host and its process is dead. See "What it will never do".
 - Test output is scrubbed of connection strings and passwords before it reaches a report.
-- Copies hold the same rows as the source. Nothing is masked, so point it at a database with seed or test data, which is what the default (your local Supabase) normally holds.
+- By default, copies hold the same rows as the source and nothing is masked, so point it at a database with seed or test data, which is what the default (your local Supabase) normally holds. To keep real rows out of the copies, use `--from-files` or `--mask` (see "Sandbox, schema and seed only, and masking").
 
 ## Claude Code
 
@@ -327,7 +471,7 @@ The Action passes `--close-sessions` by default only when `start-supabase` is `t
 
 ## Tested against
 
-`npm run test:matrix` runs six synthetic databases end to end, on PostgreSQL 16 and 17 (official `postgres` images plus pgTAP). Each fixture has its own tests and an `expected.json` that lists every break that must be caught and every break that must be missed. CI runs the same matrix.
+`npm run test:matrix` runs six synthetic databases end to end, on PostgreSQL 16 and 17 (official `postgres` images plus pgTAP and pg_cron). A seventh file, `test/matrix/modes.test.ts`, runs the sandbox, schema-and-seed, masking and pg_cron tests. Each fixture has its own tests and an `expected.json` that lists every break that must be caught and every break that must be missed. CI runs the same matrix.
 
 | Fixture | What it covers | Caught / missed |
 |---|---|---|
@@ -371,15 +515,6 @@ Turn a permission off and Guard blocks that kind of run instead of asking. It re
 
 RLS Saboteur works on top of the tests that SupaShield and rlsautotest generate: generate a suite with one of them, then run RLS Saboteur to see which breaks that suite misses.
 
-## Roadmap
-
-Planned, in no fixed order. Ideas and pull requests are welcome.
-
-- **Sandbox mode.** Run the copies inside a Docker container, so no database copy is made on the machine you run it from.
-- **Schema and seed only.** Build each copy from your schema and `seed.sql` instead of cloning the source, so no real rows are ever copied.
-- **Masking.** Scramble chosen columns in the first copy, before any break runs.
-- **pg_cron.** Test and document whether scheduled jobs can fire inside a copy.
-
 ## Develop
 
 ```sh
@@ -387,7 +522,7 @@ npm install
 npm test            # unit tests
 npm run build
 npm run test:e2e    # needs a local Postgres; set SABOTEUR_E2E_URL
-npm run test:matrix # needs Docker; starts and removes rls-saboteur-ci-16 and -17
+npm run test:matrix # needs Docker; starts and removes rls-saboteur-ci-16, -17, -b-* and -cron-* (and the sandbox containers its tests start)
 ```
 
 MIT. Copyright Matt Muller.

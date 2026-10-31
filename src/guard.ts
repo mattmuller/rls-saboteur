@@ -211,6 +211,11 @@ export interface GuardOptions {
   sourceUrl: string;
   /** Closing other sessions on the source. Only ever true for a local source without the remote flag. */
   allowTerminate: boolean;
+  /**
+   * Build mode: the master template may be created EMPTY, from template0, and filled from files or a dump.
+   * Off by default. With it off, the only master the guard allows is a copy of the source.
+   */
+  emptyMaster?: boolean;
 }
 
 export interface Db {
@@ -229,6 +234,8 @@ export class Guard {
   readonly sourceDb: string;
   /** Closing other sessions on the source. Starts as given and can only be switched off (denyTerminate). */
   allowTerminate: boolean;
+  /** Build mode only: the master may be created from template0. See GuardOptions. */
+  readonly emptyMaster: boolean;
   /** Why closing sessions was switched off after construction, for the message to the user. */
   terminateDeniedReason?: string;
   readonly token = newToken();
@@ -242,6 +249,7 @@ export class Guard {
   constructor(o: GuardOptions) {
     this.sourceDb = databaseOf(o.sourceUrl);
     this.allowTerminate = o.allowTerminate;
+    this.emptyMaster = o.emptyMaster === true;
   }
 
   /** Switch off closing sessions for the rest of the run. There is no way back on. */
@@ -319,7 +327,9 @@ export class Guard {
       const id = this.isOwnName(name);
       if (!id) throw new GuardError(`will not create "${name}": it is not a name of this run`);
       if (this.closing) throw new GuardError('the run is shutting down, so no new copy is started');
-      if (id.suffix === 'tpl' ? tpl !== this.sourceDb : !this.labelled.has(tpl)) throw new GuardError(`"${name}" may not be copied from "${tpl}"`);
+      const okTemplate =
+        id.suffix === 'tpl' ? tpl === this.sourceDb || (this.emptyMaster && tpl === 'template0') : this.labelled.has(tpl);
+      if (!okTemplate) throw new GuardError(`"${name}" may not be copied from "${tpl}"`);
       return;
     }
     m = /^comment on database ("(?:[^"]|"")+") is '([^']*)'$/i.exec(s);
