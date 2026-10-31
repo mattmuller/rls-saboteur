@@ -164,21 +164,21 @@ describe('mask: parsing', () => {
 });
 
 /** A fake database that answers the mask queries. `s` controls what it says. */
-function fakeDb(s: { exists?: boolean; type?: string; before?: number; updated?: number; left?: number; noSuper?: boolean; statsLeft?: number; parents?: string[]; outside?: { member: string; outside_parent: string }[]; copiers?: string[]; fkRefs?: string[]; tree?: { schema: string; name: string; kind: string }[]; relkind?: string; generated?: string }): { db: Db; log: string[] } {
+function fakeDb(s: { exists?: boolean; type?: string; before?: number; updated?: number; left?: number; noSuper?: boolean; statsLeft?: number; parents?: string[]; outside?: { member: string; outside_parent: string }[]; copiers?: string[]; fkPairs?: { fk_child: string; fk_parent: string }[]; tree?: { schema: string; name: string; kind: string }[]; relkind?: string; generated?: string }): { db: Db; log: string[] } {
   const log: string[] = [];
   const db: Db = {
     async end() {},
-    async query(text: string) {
+    async query(text: string, v?: unknown[]) {
       log.push(text.replace(/\s+/g, ' ').trim());
       if (/from pg_attribute a/.test(text)) {
         if (s.exists === false) return { rows: [], rowCount: 0 } as never;
         return { rows: [{ relkind: s.relkind ?? 'r', type: s.type ?? 'text', base: s.type ?? 'text', generated: s.generated ?? '', identity: '', maxlen: null }], rowCount: 1 } as never;
       }
       if (/as outside_parent/.test(text)) return { rows: s.outside ?? [], rowCount: 0 } as never;
-      if (/as ref\s+from pg_constraint/.test(text)) return { rows: (s.fkRefs ?? []).map((ref) => ({ ref })), rowCount: 0 } as never;
+      if (/as fk_child/.test(text)) return { rows: s.fkPairs ?? [], rowCount: 0 } as never;
       if (/as what/.test(text)) return { rows: (s.copiers ?? []).map((what) => ({ what })), rowCount: 0 } as never;
       if (/as parent\s+from pg_inherits/.test(text)) return { rows: (s.parents ?? []).map((parent) => ({ parent })), rowCount: 0 } as never;
-      if (/with recursive t as/.test(text)) return { rows: s.tree ?? [{ schema: 'public', name: 'users', kind: 'r' }], rowCount: 1 } as never;
+      if (/with recursive t as/.test(text)) return { rows: s.tree ?? [{ schema: String(v?.[0] ?? 'public'), name: String(v?.[1] ?? 'users'), kind: 'r' }], rowCount: 1 } as never;
       if (/from pg_stats s/.test(text)) return { rows: [{ n: s.statsLeft ?? 0 }], rowCount: 1 } as never;
       if (/session_replication_role/.test(text) && s.noSuper) throw new Error('permission denied to set parameter');
       if (/select count\(\*\) as n from _sab_mask/.test(text)) return { rows: [{ n: s.before ?? 3 }], rowCount: 1 } as never;
@@ -250,11 +250,37 @@ describe('mask: it fails closed', () => {
     expect((await validateMasks(fakeDb({ outside: [{ member: 'public.ch', outside_parent: 'public.pb' }] }).db, [parseMask('public.pa.email')]))[0]).toMatch(/outside the tree/);
   });
   it('mask-fk: a column tied to the masked one by a foreign key must be masked in the same run', async () => {
-    const { db, log } = fakeDb({ fkRefs: ['public.orders.buyer_email'] });
+    const pairs = [{ fk_child: 'public.orders.buyer_email', fk_parent: 'public.users.email' }];
+    const { db, log } = fakeDb({ fkPairs: pairs });
     await expect(applyMasks(db, [parseMask('public.users.email')], 's')).rejects.toThrow(/public\.orders\.buyer_email is tied to public\.users\.email by a foreign key/);
     expect(log.some((l) => /^update/.test(l))).toBe(false);
     // Named in the same run: allowed.
-    await expect(applyMasks(fakeDb({ fkRefs: ['public.orders.buyer_email'] }).db, [parseMask('public.users.email'), parseMask('public.orders.buyer_email')], 's')).resolves.toHaveLength(2);
+    await expect(applyMasks(fakeDb({ fkPairs: pairs }).db, [parseMask('public.users.email'), parseMask('public.orders.buyer_email')], 's')).resolves.toHaveLength(2);
+  });
+  it('mask-fk-reverse: a masked column that references another column needs that column masked too', async () => {
+    const pairs = [{ fk_child: 'public.contacts.person_email', fk_parent: 'public.people.email' }];
+    const { db, log } = fakeDb({ fkPairs: pairs });
+    await expect(applyMasks(db, [parseMask('public.contacts.person_email')], 's')).rejects.toThrow(/public\.people\.email is tied to public\.contacts\.person_email by a foreign key/);
+    expect(log.some((l) => /^update/.test(l))).toBe(false);
+    await expect(applyMasks(fakeDb({ fkPairs: pairs }).db, [parseMask('public.contacts.person_email'), parseMask('public.people.email')], 's')).resolves.toHaveLength(2);
+  });
+  it('mask-fk-chain: a chain of keys is followed in both directions, and a column below a masked table counts as masked', async () => {
+    const pairs = [
+      { fk_child: 'public.b.x', fk_parent: 'public.a.x' },
+      { fk_child: 'public.c.x', fk_parent: 'public.b.x' },
+      { fk_child: 'public.a.x', fk_parent: 'public.root.x' }
+    ];
+    // Masking b.x alone reaches a.x, c.x and, through a.x, root.x.
+    await expect(applyMasks(fakeDb({ fkPairs: pairs }).db, [parseMask('public.b.x')], 's')).rejects.toThrow(
+      /public\.a\.x is tied to public\.b\.x.*public\.c\.x is tied to public\.b\.x.*public\.root\.x is tied to public\.a\.x/
+    );
+    // One link left out is still refused.
+    await expect(applyMasks(fakeDb({ fkPairs: pairs }).db, ['public.b.x', 'public.a.x', 'public.c.x'].map(parseMask), 's')).rejects.toThrow(/public\.root\.x is tied to public\.a\.x/);
+    await expect(applyMasks(fakeDb({ fkPairs: pairs }).db, ['public.b.x', 'public.a.x', 'public.c.x', 'public.root.x'].map(parseMask), 's')).resolves.toHaveLength(4);
+    // Everything is checked before the first rewrite.
+    const { db, log } = fakeDb({ fkPairs: pairs });
+    await expect(applyMasks(db, ['public.b.x', 'public.a.x'].map(parseMask), 's')).rejects.toThrow();
+    expect(log.some((l) => /^update/.test(l))).toBe(false);
   });
   it('mask-copiers: an update rule or a materialized view over the table stops the run', async () => {
     const { db, log } = fakeDb({ copiers: ['materialized view public.people_mv'] });

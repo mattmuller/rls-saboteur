@@ -97,9 +97,10 @@ export async function validateMasks(db: Db, masks: MaskSpec[]): Promise<string[]
     }
     const why = unsupported(m, f);
     if (why) problems.push(why);
-    const up = (await parentsProblem(db, m)) ?? (await treeProblem(db, m, masks));
+    const up = (await parentsProblem(db, m)) ?? (await treeProblem(db, m));
     if (up) problems.push(up);
   }
+  if (!problems.length) problems.push(...(await linkProblems(db, masks)));
   return problems;
 }
 
@@ -184,39 +185,73 @@ export const OUTSIDE_PARENTS_SQL = `with recursive t as (
 export const COPIERS_SQL = `with recursive t as (
     select c.oid from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = $1 and c.relname = $2
     union
-    select i.inhrelid from pg_inherits i join t on i.inhparent = t.oid)
+    select i.inhrelid from pg_inherits i join t on i.inhparent = t.oid),
+  deps as (
+    select v.oid, v.relkind from pg_depend d
+      join pg_rewrite w on w.oid = d.objid and d.classid = 'pg_rewrite'::regclass
+      join pg_class v on v.oid = w.ev_class and v.relkind in ('v', 'm')
+     where d.refclassid = 'pg_class'::regclass and d.refobjid in (select oid from t)
+    union
+    select v.oid, v.relkind from deps x
+      join pg_depend d on d.refobjid = x.oid and d.refclassid = 'pg_class'::regclass
+      join pg_rewrite w on w.oid = d.objid and d.classid = 'pg_rewrite'::regclass
+      join pg_class v on v.oid = w.ev_class and v.relkind in ('v', 'm') and v.oid <> x.oid)
   select 'rule ' || r.rulename::text || ' on ' || r.ev_class::regclass::text as what from pg_rewrite r
    where r.ev_class in (select oid from t) and r.rulename <> '_RETURN' and r.ev_type in ('2', '*')
   union all
-  select 'materialized view ' || v.oid::regclass::text from pg_depend d
-    join pg_rewrite w on w.oid = d.objid and d.classid = 'pg_rewrite'::regclass
-    join pg_class v on v.oid = w.ev_class and v.relkind = 'm'
-   where d.refclassid = 'pg_class'::regclass and d.refobjid in (select oid from t)`;
+  select 'materialized view ' || oid::regclass::text from deps where relkind = 'm'`;
 
-/** Columns of other tables that a foreign key ties to the masked column. Their values are copies of the original ones. */
-export const FK_SQL = `with recursive t as (
-    select c.oid from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = $1 and c.relname = $2
-    union
-    select i.inhrelid from pg_inherits i join t on i.inhparent = t.oid)
-  select cn.nspname::text || '.' || cc.relname::text || '.' || a.attname::text as ref
-    from pg_constraint k
-    join pg_class cc on cc.oid = k.conrelid join pg_namespace cn on cn.oid = cc.relnamespace
-    cross join lateral unnest(k.conkey, k.confkey) as u(ck, fk)
-    join pg_attribute a on a.attrelid = k.conrelid and a.attnum = u.ck
-    join pg_attribute pa on pa.attrelid = k.confrelid and pa.attnum = u.fk
-   where k.contype = 'f' and pa.attname = $3 and k.confrelid in (select oid from t)`;
+/** Every foreign key column pair in the database, as schema.table.column strings. */
+export const FK_PAIRS_SQL = `select cn.nspname::text || '.' || cc.relname::text || '.' || a.attname::text as fk_child,
+       pn.nspname::text || '.' || pc.relname::text || '.' || pa.attname::text as fk_parent
+  from pg_constraint k
+  join pg_class cc on cc.oid = k.conrelid join pg_namespace cn on cn.oid = cc.relnamespace
+  join pg_class pc on pc.oid = k.confrelid join pg_namespace pn on pn.oid = pc.relnamespace
+  cross join lateral unnest(k.conkey, k.confkey) as u(ck, fk)
+  join pg_attribute a on a.attrelid = k.conrelid and a.attnum = u.ck
+  join pg_attribute pa on pa.attrelid = k.confrelid and pa.attnum = u.fk
+ where k.contype = 'f'`;
 
-async function treeProblem(db: Db, m: MaskSpec, all: MaskSpec[]): Promise<string | null> {
+/**
+ * Foreign key actions are off while the rewrite runs, and a key ties two columns to the same original values. Every column
+ * linked to a masked column, in either direction and along a chain of keys, keeps the originals unless it is masked in the same
+ * run. (The same input gives the same output, so the keys still match afterwards.) A column of a table below a masked table
+ * counts as masked when the column has the same name.
+ */
+export async function linkProblems(db: Db, masks: MaskSpec[]): Promise<string[]> {
+  const covered = new Set<string>();
+  for (const m of masks) {
+    const tree = (await db.query(TREE_SQL, [m.schema, m.table])).rows as { schema: string; name: string }[];
+    for (const t of tree) covered.add(`${t.schema}.${t.name}.${m.column}`);
+  }
+  const pairs = (await db.query(FK_PAIRS_SQL)).rows as { fk_child: string; fk_parent: string }[];
+  const adj = new Map<string, string[]>();
+  const link = (x: string, y: string): void => {
+    adj.set(x, [...(adj.get(x) ?? []), y]);
+  };
+  for (const p of pairs) {
+    link(p.fk_child, p.fk_parent);
+    link(p.fk_parent, p.fk_child);
+  }
+  const seen = new Set<string>(covered);
+  const queue = [...covered];
+  const found: string[] = [];
+  while (queue.length) {
+    const x = queue.shift()!;
+    for (const y of adj.get(x) ?? []) {
+      if (seen.has(y)) continue;
+      seen.add(y);
+      queue.push(y);
+      found.push(`${y} is tied to ${x} by a foreign key`);
+    }
+  }
+  return found.length ? [`${found.join('; ')}, and would keep the original values. Mask each of them in the same run`] : [];
+}
+
+async function treeProblem(db: Db, m: MaskSpec): Promise<string | null> {
   const out = (await db.query(OUTSIDE_PARENTS_SQL, [m.schema, m.table])).rows as { member: string; outside_parent: string }[];
   if (out.length) {
     return `${out.map((x) => `${x.member} also inherits from ${x.outside_parent}`).join(', ')}, which is outside the tree of ${m.schema}.${m.table}, and the statistics of that parent would keep the original values. Mask the root of every tree that holds this data`;
-  }
-  // Foreign key actions are off while the rewrite runs, so a column tied to the masked one by a foreign key keeps the
-  // original values. It must be masked in the same run (the same input gives the same output, so the keys still match).
-  const named = new Set(all.map((x) => `${x.schema}.${x.table}.${x.column}`));
-  const unmasked = ((await db.query(FK_SQL, [m.schema, m.table, m.column])).rows as { ref: string }[]).map((x) => x.ref).filter((r) => !named.has(r));
-  if (unmasked.length) {
-    return `${unmasked.join(', ')} ${unmasked.length === 1 ? 'is' : 'are'} tied to ${m.schema}.${m.table}.${m.column} by a foreign key and would keep the original values. Mask ${unmasked.length === 1 ? 'it' : 'them'} in the same run`;
   }
   const copiers = ((await db.query(COPIERS_SQL, [m.schema, m.table])).rows as { what: string }[]).map((x) => x.what);
   if (copiers.length) {
@@ -239,15 +274,13 @@ export interface MaskedColumn {
  * After each rewrite the same session checks that every non-null row was touched and that no original value is left.
  */
 export async function applyMasks(db: Db, masks: MaskSpec[], salt: string = randomBytes(16).toString('hex')): Promise<MaskedColumn[]> {
+  // Everything that can be refused is checked for ALL columns before the first one is rewritten.
+  const problems = await validateMasks(db, masks);
+  if (problems.length) throw new Error(`masking stopped: ${problems.join('; ')}`);
   const done: MaskedColumn[] = [];
   for (const m of masks) {
     const label = maskText(m);
-    const f = await factsOf(db, m);
-    if (typeof f === 'string') throw new Error(`masking stopped: ${f}`);
-    const why = unsupported(m, f);
-    if (why) throw new Error(`masking stopped: ${why}`);
-    const up = (await parentsProblem(db, m)) ?? (await treeProblem(db, m, masks));
-    if (up) throw new Error(`masking stopped: ${up}`);
+    const f = (await factsOf(db, m)) as ColumnFacts;
     const tbl = `${qi(m.schema)}.${qi(m.table)}`;
     const col = qi(m.column);
     const tree = (await db.query(TREE_SQL, [m.schema, m.table])).rows as { schema: string; name: string; kind: string }[];

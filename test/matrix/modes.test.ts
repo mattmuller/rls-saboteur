@@ -289,14 +289,14 @@ describe.skipIf(!superUrl)('build modes', () => {
   it('mask-copiers: a materialized view or an update rule over the masked table stops the run before any copy', async () => {
     await makeSource();
     const c = await open(urlFor(DB));
-    await c.query(`create materialized view people_mv as select email from people;`);
+    await c.query(`create view people_v as select email from people; create view people_v2 as select email from people_v; create materialized view people_mv as select email from people_v2;`); // read through two views
     await c.end();
     const r = runCli(['--mask', 'public.people.email']);
     expect(r.status, r.out).toBe(2);
     expect(r.out).toMatch(/materialized view (public\.)?people_mv would keep a copy/);
     expect(r.observed).toBe('');
     const c2 = await open(urlFor(DB));
-    await c2.query(`drop materialized view people_mv; create table people_log (old_email text); create rule log_update as on update to people do also insert into people_log values (old.email);`);
+    await c2.query(`drop materialized view people_mv; drop view people_v2; drop view people_v; create table people_log (old_email text); create rule log_update as on update to people do also insert into people_log values (old.email);`);
     await c2.end();
     const r2 = runCli(['--mask', 'public.people.email']);
     expect(r2.status, r2.out).toBe(2);
@@ -313,6 +313,11 @@ describe.skipIf(!superUrl)('build modes', () => {
     expect(alone.status, alone.out).toBe(2);
     expect(alone.out).toMatch(/public\.contacts\.person_email is tied to public\.people\.email by a foreign key/);
     expect(alone.observed).toBe('');
+    // The other direction: the masked column references people.email, which holds the same original values.
+    const reverse = runCli(['--mask', 'public.contacts.person_email']);
+    expect(reverse.status, reverse.out).toBe(2);
+    expect(reverse.out).toMatch(/public\.people\.email is tied to public\.contacts\.person_email by a foreign key/);
+    expect(reverse.observed).toBe('');
     const both = runCli(['--mask', 'public.people.email', '--mask', 'public.contacts.person_email', '--jobs', '1']);
     expect(both.status, both.out).toBe(1);
     const peopleLines = both.observed.split('\n').filter((l) => l.startsWith('people|'));
