@@ -253,6 +253,7 @@ export async function run(o: RunOptions): Promise<RunOutput> {
       dbUrl: o.dbUrl,
       image: sandboxImageFor(o, facts),
       files: o.buildFiles ?? null,
+      schemas: o.schemas,
       cwd: o.cwd ?? process.cwd(),
       isolateNetwork: o.isolateNetwork,
       masks: o.masks,

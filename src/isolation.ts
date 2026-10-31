@@ -83,8 +83,9 @@ export interface IsolationOptions {
   /** Columns to scramble in the master, after it is built and before anything else touches it. */
   masks?: MaskSpec[];
   /**
-   * Build mode: the master is created EMPTY (from template0) and this fills it, from files or a dump. The source is not
-   * cloned, so no closing of sessions is ever needed. Needs emptyMaster.
+   * Build mode: runs on the new master and fills it, from files or a dump. With emptyMaster the master starts EMPTY (from
+   * template0) and nothing is cloned. Without it, the master is a clone of the source database (the sandbox uses this for the
+   * database an image ships with) and the build adds to it.
    */
   build?: (masterUrl: string, guard: Guard, between: () => Promise<void>) => Promise<void>;
   emptyMaster?: boolean;
@@ -103,8 +104,7 @@ export async function createIsolation(o: IsolationOptions): Promise<Isolation> {
   const local = urlIsLocal(o.sourceUrl) && (!o.adminUrl || urlIsLocal(o.adminUrl));
   const sourceProblem = sourceNameProblem(sourceDb);
   if (sourceProblem) throw new Error(sourceProblem);
-  if (o.build && !o.emptyMaster) throw new Error('internal: build mode needs emptyMaster');
-  const guard = new Guard({ sourceUrl: o.sourceUrl, allowTerminate: o.terminate && !o.allowRemote && local && !o.build, emptyMaster: o.emptyMaster });
+  const guard = new Guard({ sourceUrl: o.sourceUrl, allowTerminate: o.terminate && !o.allowRemote && local && !o.emptyMaster, emptyMaster: o.emptyMaster });
   const master = guard.masterName();
   const WAIT_MS = o.cleanupWaitMs ?? 30_000;
 
@@ -186,7 +186,7 @@ export async function createIsolation(o: IsolationOptions): Promise<Isolation> {
       }
     }
     await sweepStale(admin, guard.sourceDb, guard.token);
-    const created = o.build ? await makeEmptyMaster(guard, admin, master, owner) : await makeMaster(guard, admin, master, owner, o, notes);
+    const created = o.emptyMaster ? await makeEmptyMaster(guard, admin, master, owner) : await makeMaster(guard, admin, master, owner, o, notes);
     if (!created.ok) {
       throw new Error(
         `Could not copy the database: ${created.reason}\n` +
@@ -253,7 +253,7 @@ export async function createIsolation(o: IsolationOptions): Promise<Isolation> {
 
     ready = true;
     return {
-      mode: o.build ? 'files' : 'template',
+      mode: o.emptyMaster ? 'files' : 'template',
       notes,
       masked,
       withBreak: (brk, fn) => withCopy(brk, fn),

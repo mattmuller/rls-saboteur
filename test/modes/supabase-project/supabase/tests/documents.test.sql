@@ -1,0 +1,10 @@
+begin;
+select plan(4);
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-0000000000a1', true);
+select is((select count(*)::int from public.documents), 1, 'a member sees only the documents of their org');
+select is((select count(*)::int from public.documents where title = 'Seed doc B'), 0, 'a member cannot see another org''s document');
+select is((select count(*)::int from public.orgs), 1, 'a member sees only their org');
+select throws_ok($$insert into public.documents (org_id, author_id, title) values ('10000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-0000000000a1', 'planted')$$, '42501', null, 'cannot write into an org you are not in');
+select * from finish();
+rollback;

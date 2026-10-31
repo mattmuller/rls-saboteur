@@ -131,7 +131,13 @@ async function main(): Promise<number> {
   const threshold = v.threshold !== undefined ? parsePercent(v.threshold, '--threshold') : file.threshold !== undefined ? parsePercent(String(file.threshold), `"threshold" in ${CONFIG_FILE}`) : 100;
   const jobs = v.jobs !== undefined ? parseJobs(v.jobs) : 2;
   const timeoutSeconds = v.timeout !== undefined ? parseSeconds(v.timeout) : 600;
-  const runner = parseRunner(v.runner);
+  let runner = parseRunner(v.runner);
+  if (v.sandbox) {
+    // The Supabase CLI runs pg_prove in its own container, which on Docker Desktop for Mac could not reach the sandbox
+    // (connection refused, in both modes). psql and --test run on this machine and do.
+    if (runner === 'supabase') throw new Error('--runner supabase does not work with --sandbox: the Supabase CLI runs pg_prove in a container that cannot reach the sandbox. Use --runner psql (the default with --sandbox) or --test.');
+    if (runner === 'auto') runner = 'psql';
+  }
   const maxSizeBytes = v['max-size'] !== undefined ? parseSize(v['max-size']) : DEFAULT_MAX_SIZE;
   if (v['isolate-network'] && v['no-isolate-network']) throw new Error('--isolate-network and --no-isolate-network contradict each other.');
   const urlProblem =

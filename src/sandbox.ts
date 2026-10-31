@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import net from 'node:net';
+import { Transform } from 'node:stream';
 import { withDatabase } from './config.js';
 import {
   CONTAINER_PREFIX,
@@ -42,6 +43,8 @@ export interface Sandbox {
   password: string;
   /** URL of a database in the container. Loopback only. */
   url(db: string): string;
+  /** True when the image ships a Supabase-style database (schemas auth and storage in `postgres`). */
+  managed: boolean;
   /** Proves again that the server asks for a password. Run after anything of yours has run in the container. */
   checkAuth(): Promise<void>;
   /** Removes the container. Returns true when it is gone. */
@@ -149,6 +152,11 @@ export async function startSandbox(image: string, token: string, isolated = fals
     const port = relay ? relay.port : readPort(name);
     const user = await waitReady(port, password, name);
     // Every client of the relay (and of the published port) must need the password. Prove it with a wrong one.
+    // Some images (the Supabase one) trust loopback in their own pg_hba.conf. Replace it before anything of yours runs:
+    // password rules on every host line, and only the unix socket (reachable only inside the container) trusted. The checks
+    // below then prove it held. If the file cannot be replaced, the checks fail and the run stops.
+    hardenHba(name, user, password);
+    const managed = psqlValue(name, user, password, "select exists (select 1 from pg_namespace where nspname in ('auth', 'storage'))") === 't';
     const checkAuth = async (): Promise<void> => {
       await assertAuthEnforced(
         (u, pw, db) => `postgres://${encodeURIComponent(u)}:${pw}@127.0.0.1:${port}/${db}`,
@@ -166,18 +174,39 @@ export async function startSandbox(image: string, token: string, isolated = fals
     await checkAuth();
     return {
       checkAuth,
+      managed,
       name,
       isolated,
       port,
       user,
       password,
-      url: (db) => withDatabase(`postgres://${user}:${password}@127.0.0.1:${port}/postgres`, db),
+      // The server speaks no TLS. The Supabase CLI insists on being told so.
+      url: (db) => withDatabase(`postgres://${user}:${password}@127.0.0.1:${port}/postgres?sslmode=disable`, db),
       remove
     };
   } catch (e) {
     await remove();
     throw e;
   }
+}
+
+/** One value from the container's `postgres` database, through psql inside the container. */
+function psqlValue(name: string, user: string, password: string, sql: string): string {
+  const r = docker(['exec', '-e', 'PGPASSWORD', name, 'psql', '-X', '-At', '-v', 'ON_ERROR_STOP=1', '-h', '127.0.0.1', '-U', user, '-d', 'postgres', '-c', sql], name, { PGPASSWORD: password });
+  if (r.code !== 0) throw new Error(`sandbox: a command inside the container failed (${r.stderr.trim().split('\n').slice(-1)[0] ?? ''})`);
+  return r.stdout.trim();
+}
+
+/** The pg_hba.conf the sandbox runs with. The unix socket is reachable only from inside the container. */
+export const SANDBOX_HBA = ['local all all trust', 'host all all all scram-sha-256'];
+
+export function hardenHba(name: string, user: string, password: string): void {
+  const path = psqlValue(name, user, password, 'show hba_file');
+  if (!/^\/[A-Za-z0-9_./-]+$/.test(path)) throw new Error(`sandbox: the pg_hba.conf path "${path.replace(/[^\x20-\x7e]/g, '?')}" is not one the tool will write to`);
+  const rows = SANDBOX_HBA.map((l) => `'${l}'`).join(', ');
+  psqlValue(name, user, password, `copy (select unnest(array[${rows}])) to program 'cat > ${path}'`);
+  psqlValue(name, user, password, 'select pg_reload_conf()');
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 600); // let the server pick the new file up before it is checked
 }
 
 function readPort(name: string): number {
@@ -335,11 +364,39 @@ export function containerHostFor(host: string): string {
   return h === 'localhost' || h === '127.0.0.1' || h === '::1' ? 'host.docker.internal' : host;
 }
 
+/**
+ * Foreign keys from the dumped schemas to tables in other schemas (auth.users above all) are created NOT VALID. Those tables are
+ * empty in the sandbox, so the rows that point at them would fail validation. New rows are still checked. Line by line: pg_dump
+ * writes each constraint on one line of the form `ADD CONSTRAINT x FOREIGN KEY (a) REFERENCES schema.table(b) [actions];`.
+ */
+export function notValidForeignKeys(dumped: string[]): Transform {
+  const own = new Set(dumped.map((x) => x.toLowerCase()));
+  let rest = '';
+  const fix = (line: string): string => {
+    const m = /^\s+ADD CONSTRAINT .* FOREIGN KEY \(.*\) REFERENCES ("(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_$]*)\./.exec(line);
+    if (!m || !line.endsWith(';') || /NOT VALID;$/.test(line)) return line;
+    const schema = m[1].startsWith('"') ? m[1].slice(1, -1).replace(/""/g, '"') : m[1].toLowerCase();
+    return own.has(schema.toLowerCase()) ? line : `${line.slice(0, -1)} NOT VALID;`;
+  };
+  return new Transform({
+    transform(chunk: Buffer, _enc, cb) {
+      rest += chunk.toString('utf8');
+      const lines = rest.split('\n');
+      rest = lines.pop() ?? '';
+      cb(null, lines.map(fix).join('\n') + (lines.length ? '\n' : ''));
+    },
+    flush(cb) {
+      cb(null, fix(rest));
+    }
+  });
+}
+
 function pipeInto(
   sb: Sandbox,
   producer: { args: string[]; env: Record<string, string> } | null,
   consumer: { args: string[]; input?: string },
-  urls: string[]
+  urls: string[],
+  filter?: Transform
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const load = dockerSpawn(consumer.args, sb.name, { PGPASSWORD: sb.password });
@@ -349,7 +406,7 @@ function pipeInto(
     load.stderr?.on('data', (d: Buffer) => (errLoad = (errLoad + d.toString()).slice(-8000)));
     dump?.stderr?.on('data', (d: Buffer) => (errDump = (errDump + d.toString()).slice(-8000)));
     load.stdin?.on('error', () => {});
-    if (dump) dump.stdout?.pipe(load.stdin!);
+    if (dump) (filter ? dump.stdout?.pipe(filter) : dump.stdout)?.pipe(load.stdin!);
     else {
       load.stdin?.end(consumer.input ?? '');
     }
@@ -385,6 +442,8 @@ export interface SandboxIsolationOptions {
   prepareMaster?: IsolationOptions['prepareMaster'];
   verifyMaster?: IsolationOptions['verifyMaster'];
   cleanupWaitMs?: number;
+  /** The schemas to cover (--schemas). A dump of a database with managed schemas is limited to these. */
+  schemas?: string[];
 }
 
 export async function createSandboxIsolation(o: SandboxIsolationOptions): Promise<Isolation> {
@@ -434,16 +493,20 @@ export async function createSandboxIsolation(o: SandboxIsolationOptions): Promis
   try {
     const sourceUrl = box.url('postgres');
     const sourceGuardUrls = [o.dbUrl, sourceUrl];
+    // Files, or an image that ships a managed database (Supabase: schemas auth, storage, ...): the master is a clone of the
+    // image's own `postgres` database, with its sessions closed for a moment (they are the image's workers, in a container
+    // that is ours). Otherwise the master starts empty and the dump fills it.
+    const cloneBase = o.files !== null || box.managed;
     const iso = await createIsolation({
       sourceUrl,
-      terminate: false,
+      terminate: cloneBase,
       isolateNetwork: o.isolateNetwork,
       masks: o.masks,
       prepareMaster: o.prepareMaster,
       verifyMaster: o.verifyMaster,
       cleanupWaitMs: o.cleanupWaitMs,
       manageSignals: false,
-      emptyMaster: true,
+      emptyMaster: !cloneBase,
       build: async (masterUrl, guard, between) => {
         if (o.files) {
           const m = await guard.connect(masterUrl);
@@ -453,7 +516,7 @@ export async function createSandboxIsolation(o: SandboxIsolationOptions): Promis
             await m.end().catch(() => {});
           }
         } else {
-          await dumpInto(sb, o.dbUrl, databaseOf(masterUrl), sourceGuardUrls);
+          await dumpInto(box, o.dbUrl, databaseOf(masterUrl), sourceGuardUrls, box.managed ? (o.schemas?.length ? o.schemas : ['public']) : null);
         }
         // Your files (or the restored dump) have run as superuser. They could have loosened pg_hba.conf and reloaded it.
         await box.checkAuth();
@@ -493,7 +556,7 @@ export async function createSandboxIsolation(o: SandboxIsolationOptions): Promis
 }
 
 /** Copies the source into the master database inside the container: roles first, then pg_dump piped into psql. */
-async function dumpInto(sb: Sandbox, dbUrl: string, masterDb: string, urls: string[]): Promise<void> {
+async function dumpInto(sb: Sandbox, dbUrl: string, masterDb: string, urls: string[], onlySchemas: string[] | null): Promise<void> {
   const u = new URL(dbUrl);
   const host = decodeURIComponent(u.hostname);
   if (!isLocalHost(host)) throw new Error('sandbox: the source host is not local');
@@ -518,15 +581,24 @@ async function dumpInto(sb: Sandbox, dbUrl: string, masterDb: string, urls: stri
     '-h', '127.0.0.1', '-U', sb.user, '-d', db
   ];
   await pipeInto(sb, null, { args: psqlArgs('postgres', false), input: script }, urls);
+  if (onlySchemas) {
+    // The master is a clone of the image's own database, which already has an empty `public`. The dump creates its schemas
+    // itself, so the empty ones are dropped first. (Only the schemas you asked for; auth, storage and the rest stay.)
+    for (const x of onlySchemas) {
+      if (unsafeRoleName(x)) throw new Error(`sandbox: the schema name "${x.replace(/[^\x20-\x7e]/g, '?')}" is not one the tool will use`);
+    }
+    await pipeInto(sb, null, { args: psqlArgs(masterDb, false), input: onlySchemas.map((x) => `drop schema if exists ${qi(x)} cascade;`).join('\n') + '\n' }, urls);
+  }
   const dumpEnv = dumpEnvFor(dbUrl);
   await pipeInto(
     sb,
     {
-      args: ['exec', '-e', 'PGPASSWORD', '-e', 'PGOPTIONS', '-e', 'PGHOST', '-e', 'PGPORT', '-e', 'PGUSER', '-e', 'PGDATABASE', sb.name, 'pg_dump', '--no-publications', '--no-subscriptions', '--no-tablespaces'],
+      args: ['exec', '-e', 'PGPASSWORD', '-e', 'PGOPTIONS', '-e', 'PGHOST', '-e', 'PGPORT', '-e', 'PGUSER', '-e', 'PGDATABASE', sb.name, 'pg_dump', '--no-publications', '--no-subscriptions', '--no-tablespaces', ...(onlySchemas ?? []).map((x) => `--schema=${x}`)],
       env: dumpEnv
     },
     { args: psqlArgs(masterDb, true) },
-    urls
+    urls,
+    onlySchemas ? notValidForeignKeys(onlySchemas) : undefined
   ).catch((e: Error) => {
     throw new Error(
       `sandbox: loading the dump into the container failed:\n${e.message}${pgCronHint(e.message)}\n` +

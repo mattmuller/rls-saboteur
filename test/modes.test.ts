@@ -17,7 +17,8 @@ import {
 import { applyMasks, maskText, parseMask, scrambleExpr, validateMasks } from '../src/mask.js';
 import { discoverBuildFiles, pgCronHint } from '../src/files.js';
 import { modeLines, policyDifferences, sandboxImageFor } from '../src/run.js';
-import { PASSWORDLESS_RULES_SQL, assertAuthEnforced, assertNoPasswordlessHostRules, containerHostFor, dumpEnvFor, rolesScript } from '../src/sandbox.js';
+import { Readable } from 'node:stream';
+import { PASSWORDLESS_RULES_SQL, SANDBOX_HBA, notValidForeignKeys, assertAuthEnforced, assertNoPasswordlessHostRules, containerHostFor, dumpEnvFor, rolesScript } from '../src/sandbox.js';
 import type { Db } from '../src/guard.js';
 import type { Policy } from '../src/types.js';
 
@@ -394,6 +395,29 @@ describe('plan lines and helpers', () => {
     expect(seen[0].u).toBe('sup');
     expect(seen[1].u).toMatch(/^nobody_[0-9a-f]{12}$/);
     expect(seen.every((x) => /^wrong-[0-9a-f]{16}$/.test(x.pw))).toBe(true);
+  });
+  it('sandbox-fk: only foreign keys that point outside the dumped schemas become NOT VALID', async () => {
+    const sql = [
+      'ALTER TABLE ONLY public.documents',
+      '    ADD CONSTRAINT documents_author_id_fkey FOREIGN KEY (author_id) REFERENCES auth.users(id);',
+      'ALTER TABLE ONLY public.documents',
+      '    ADD CONSTRAINT documents_org_id_fkey FOREIGN KEY (org_id) REFERENCES public.orgs(id) ON DELETE CASCADE;',
+      'ALTER TABLE ONLY public.x',
+      '    ADD CONSTRAINT x_fkey FOREIGN KEY (a) REFERENCES "Other Schema".t(id) ON DELETE CASCADE;',
+      "INSERT INTO public.t VALUES ('    ADD CONSTRAINT y FOREIGN KEY (a) REFERENCES auth.users(id);');",
+      ''
+    ].join('\n');
+    const chunks = [sql.slice(0, 77), sql.slice(77)]; // a chunk boundary inside a line
+    const out = (await Readable.from(chunks).pipe(notValidForeignKeys(['public'])).toArray()).map((c) => c.toString()).join('');
+    const lines = out.split('\n');
+    expect(lines[1]).toBe('    ADD CONSTRAINT documents_author_id_fkey FOREIGN KEY (author_id) REFERENCES auth.users(id) NOT VALID;');
+    expect(lines[3]).toBe('    ADD CONSTRAINT documents_org_id_fkey FOREIGN KEY (org_id) REFERENCES public.orgs(id) ON DELETE CASCADE;');
+    expect(lines[5]).toMatch(/"Other Schema"\.t\(id\) ON DELETE CASCADE NOT VALID;$/);
+    expect(lines[6]).toBe("INSERT INTO public.t VALUES ('    ADD CONSTRAINT y FOREIGN KEY (a) REFERENCES auth.users(id);');");
+    expect(out).toBe(out.replace(/ NOT VALID; NOT VALID/g, ' NOT VALID')); // never twice
+  });
+  it('sandbox-hba: the file the tool writes trusts only the socket and asks for a password on every host line', () => {
+    expect(SANDBOX_HBA).toEqual(['local all all trust', 'host all all all scram-sha-256']);
   });
   it('sandbox-auth-rules: a host rule that needs no password stops the run', async () => {
     await expect(assertNoPasswordlessHostRules(async () => ({ rows: [] }))).resolves.toBeUndefined();

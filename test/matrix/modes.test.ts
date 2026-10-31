@@ -766,3 +766,98 @@ describe.skipIf(!cronUrl)('pg_cron', () => {
 function dirOf(p: string): string {
   return p.slice(0, p.lastIndexOf('/'));
 }
+
+/**
+ * A real Supabase-shaped project on the Supabase Postgres image: auth.uid() policies, supabase/migrations, a seed.
+ * Needs Docker and SABOTEUR_MATRIX_SUPABASE_IMAGE (a local copy of the image; CI does not set it, so CI skips these).
+ * The image trusts loopback in its own pg_hba.conf. The sandbox replaces that file and proves it held.
+ */
+const supaImage = process.env.SABOTEUR_MATRIX_SUPABASE_IMAGE;
+describe.skipIf(!supaImage)('sandbox on the Supabase image', () => {
+  const proj = join(root, 'test', 'modes', 'supabase-project');
+  let src = '';
+  let srcName = '';
+  let dir = '';
+  const sh = (args: string[]): { status: number | null; out: string } => {
+    const r = spawnSync('docker', args, { encoding: 'utf8' });
+    return { status: r.status, out: (r.stdout ?? '') + (r.stderr ?? '') };
+  };
+  beforeAll(async () => {
+    scratch ||= mkdtempSync(join(tmpdir(), 'rls-saboteur-modes-'));
+    dir = join(scratch, 'supa');
+    cpSync(proj, dir, { recursive: true });
+    srcName = `rls-saboteur-ci-supa-src-${process.pid}`;
+    const run = sh(['run', '-d', '--name', srcName, '-e', 'POSTGRES_PASSWORD=pw', '-p', '127.0.0.1::5432', supaImage!]);
+    if (run.status !== 0) throw new Error(run.out);
+    const port = sh(['port', srcName, '5432/tcp']).out.match(/127\.0\.0\.1:(\d+)/)![1];
+    src = `postgres://supabase_admin:pw@127.0.0.1:${port}/postgres`;
+    let up = false;
+    for (let i = 0; i < 60 && !up; i++) {
+      const c = new pg.Client({ connectionString: src });
+      c.on('error', () => {});
+      try {
+        await c.connect();
+        await c.query('select 1');
+        up = true;
+        // The source: the migrations, then one real-looking user, org and document that must never reach a copy unmasked.
+        await c.query(readFileSync(join(proj, 'supabase', 'migrations', '20260101000000_app.sql'), 'utf8'));
+        await c.query(`insert into auth.users (id,email) values ('99999999-0000-0000-0000-000000000001','REAL-zoe@corp.example');
+          insert into public.orgs(id,name) values ('90000000-0000-0000-0000-000000000001','REAL Org');
+          insert into public.members(org_id,user_id) values ('90000000-0000-0000-0000-000000000001','99999999-0000-0000-0000-000000000001');
+          insert into public.documents(org_id,author_id,title,body) values ('90000000-0000-0000-0000-000000000001','99999999-0000-0000-0000-000000000001','REAL secret doc','REAL private body');`);
+      } catch {
+        await sleep(2000);
+      } finally {
+        await c.end().catch(() => {});
+      }
+    }
+    if (!up) throw new Error('the Supabase source container did not start');
+  }, 300_000);
+  afterAll(() => {
+    if (srcName) sh(['rm', '-f', '-v', srcName]);
+  });
+
+  const go = (extra: string[], observe: string): { status: number | null; out: string; observed: string } => {
+    const obs = join(scratch, `${observe}.txt`);
+    writeFileSync(obs, '');
+    const r = spawnSync(
+      'node',
+      [cli, '--db-url', src, '--runner', 'psql', '--sandbox', '--sandbox-image', supaImage!, '--yes', '--jobs', '1', '--report', join(scratch, `${observe}.md`), '--json-file', join(scratch, `${observe}.json`), ...extra],
+      { cwd: dir, encoding: 'utf8', env: { ...process.env, OBSERVE_FILE: obs }, timeout: 600_000 }
+    );
+    return { status: r.status, out: `${r.stdout}\n${r.stderr}`, observed: readFileSync(obs, 'utf8') };
+  };
+
+  it('sandbox-supabase-files: a Supabase project runs on the Supabase image from its migrations and seed, with real pgTAP, and the image is made to ask for a password', () => {
+    const r = go(['--from-files', '--tests-dir', 'supabase/tests'], 'supa-files');
+    expect(r.status, r.out).toBe(1); // some breaks are missed by design
+    expect(r.out).toMatch(/Baseline\s+all 4 tests pass/);
+    expect(r.out).toMatch(/caught\s+[1-9]\d* \/ 18/);
+    expect(r.out).toContain('no network at all');
+    expect(sandboxContainers()).toEqual([]);
+  });
+
+  it('sandbox-supabase-files-rows: only the seed reaches the copies', () => {
+    const r = go(['--from-files', '--test', join(dir, 'observe.sh')], 'supa-files-rows');
+    expect(r.status, r.out).toBe(1);
+    expect(r.observed).toContain('user|seed-ann@example.test');
+    expect(r.observed).toContain('doc|Seed doc A|seed body a');
+    expect(r.observed).not.toMatch(/REAL/);
+  });
+
+  it('sandbox-supabase-dump: the source is dumped onto the image\'s own database, masked, with foreign keys to auth.users kept', () => {
+    const r = go(['--test', join(dir, 'observe.sh'), '--mask', 'public.documents.title'], 'supa-dump');
+    expect(r.status, r.out).toBe(1);
+    expect(r.out).toContain('pg_dump runs in it');
+    expect(r.observed).toMatch(/doc\|[0-9a-f]{32}\|REAL private body/); // title masked, body (not named) as it was
+    expect(r.observed).not.toContain('REAL secret doc');
+    expect(sandboxContainers()).toEqual([]);
+  });
+
+  it('sandbox-supabase-runner: --runner supabase with --sandbox is refused before anything starts', () => {
+    const r = go(['--from-files', '--runner', 'supabase'], 'supa-runner');
+    expect(r.status, r.out).toBe(2);
+    expect(r.out).toMatch(/--runner supabase does not work with --sandbox/);
+    expect(sandboxContainers()).toEqual([]);
+  });
+});

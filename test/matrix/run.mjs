@@ -85,7 +85,9 @@ try {
       SABOTEUR_MATRIX_URL: `postgres://postgres:postgres@127.0.0.1:${port(v)}/postgres`,
       SABOTEUR_MATRIX_URL_B: `postgres://postgres:postgres@127.0.0.1:${portB(v)}/postgres`,
       SABOTEUR_MATRIX_URL_CRON: `postgres://postgres:postgres@127.0.0.1:${portC(v)}/postgres`,
-      SABOTEUR_MATRIX_IMAGE: image(v)
+      SABOTEUR_MATRIX_IMAGE: image(v),
+      // Optional: a local copy of the Supabase Postgres image turns on the Supabase tests. CI does not have it.
+      ...(process.env.SABOTEUR_MATRIX_SUPABASE_IMAGE ? { SABOTEUR_MATRIX_SUPABASE_IMAGE: process.env.SABOTEUR_MATRIX_SUPABASE_IMAGE } : {})
     } });
     if (r.status !== 0) failed = true;
   }
