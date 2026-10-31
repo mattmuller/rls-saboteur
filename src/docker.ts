@@ -17,6 +17,18 @@ export const LABEL_HOST = 'rls-saboteur.host';
 export const LABEL_PID = 'rls-saboteur.pid';
 export const LABEL_TOKEN = 'rls-saboteur.token';
 
+export const NET_PREFIX = 'rls-saboteur-sandbox-net-';
+
+/** The internal network that goes with a container (--from-files mode). Same id, so one name implies the other. */
+export function netNameFor(containerName: string): string {
+  const id = parseContainerName(containerName);
+  if (!id) throw new DockerGuardError('bad container name');
+  return `${NET_PREFIX}${id.host}-${id.pid}-${id.token}`;
+}
+
+/** The shell script `docker exec` runs in the container to carry one TCP connection to the server inside it. */
+export const RELAY_SCRIPT = 'exec 3<>/dev/tcp/127.0.0.1/5432 || exit 1; cat <&3 & cat >&3; exit 0';
+
 export function containerNameFor(host: string, pid: number, token: string): string {
   return `${CONTAINER_PREFIX}${host}-${pid}-${token}`;
 }
@@ -64,6 +76,20 @@ export function removableContainer(
   return { ok: false, why: `"${name}" was not made by this run, and is not a container of a dead process of this host` };
 }
 
+/** The same rule as removableContainer, for the network of a container. */
+export function removableNetwork(
+  name: string,
+  labels: Record<string, string>,
+  token: string,
+  isAlive: (pid: number) => boolean = pidAlive,
+  host: string = hostId()
+): { ok: true } | { ok: false; why: string } {
+  const m = /^rls-saboteur-sandbox-net-([0-9a-f]{12})-(\d{1,10})-([0-9a-f]{16})$/.exec(name);
+  if (!m) return { ok: false, why: `"${name}" does not have the name of a sandbox network` };
+  const owner = containerNameFor(m[1], Number(m[2]), m[3]);
+  return removableContainer(owner, labels, token, isAlive, host);
+}
+
 export class DockerGuardError extends Error {
   constructor(message: string) {
     super(`Refused by the Docker guard: ${message}`);
@@ -85,7 +111,9 @@ export function checkDockerArgs(args: string[], ownName: string): void {
   const same = (a: string[], b: string[]): boolean => a.length === b.length && a.every((x, i) => x === b[i]);
   switch (verb) {
     case 'run': {
-      // docker run -d --rm --name N --label k=v x4 -e POSTGRES_PASSWORD -p 127.0.0.1::5432 --add-host host.docker.internal:host-gateway IMAGE
+      // docker run -d --rm --name N --label k=v x4 -e POSTGRES_PASSWORD
+      //   then either  -p 127.0.0.1::5432 --add-host host.docker.internal:host-gateway IMAGE       (rows come from a dump)
+      //   or           --network NET IMAGE   (NET is internal: no route to the host or the internet; files mode)
       const fixedHead = ['-d', '--rm', '--name'];
       if (!same(rest.slice(0, 3), fixedHead)) break;
       const name = rest[3];
@@ -100,11 +128,24 @@ export function checkDockerArgs(args: string[], ownName: string): void {
       ];
       if (!same(labels, wantLabels)) break;
       const tail = rest.slice(12);
-      const wantTail = ['-e', 'POSTGRES_PASSWORD', '-p', '127.0.0.1::5432', '--add-host', 'host.docker.internal:host-gateway'];
-      if (!same(tail.slice(0, wantTail.length), wantTail)) break;
-      const image = tail[wantTail.length];
-      if (tail.length !== wantTail.length + 1 || !image || image.startsWith('-') || !IMAGE_PATTERN.test(image)) break;
+      const bridge = ['-e', 'POSTGRES_PASSWORD', '-p', '127.0.0.1::5432', '--add-host', 'host.docker.internal:host-gateway'];
+      const isolated = ['-e', 'POSTGRES_PASSWORD', '--network', netNameFor(name)];
+      const want = tail[2] === '--network' ? isolated : bridge;
+      if (!same(tail.slice(0, want.length), want)) break;
+      const image = tail[want.length];
+      if (tail.length !== want.length + 1 || !image || image.startsWith('-') || !IMAGE_PATTERN.test(image)) break;
       return;
+    }
+    case 'network': {
+      const [sub, ...r] = rest;
+      const id = parseContainerName(ownName);
+      if (!id) break;
+      const labelArgs = ['--label', `${LABEL_KEY}=1`, '--label', `${LABEL_HOST}=${id.host}`, '--label', `${LABEL_PID}=${id.pid}`, '--label', `${LABEL_TOKEN}=${id.token}`];
+      const own = netNameFor(ownName);
+      if (sub === 'create' && same(r, ['--internal', ...labelArgs, own])) return;
+      if (sub === 'rm' && r.length === 1 && /^rls-saboteur-sandbox-net-[0-9a-f]{12}-\d{1,10}-[0-9a-f]{16}$/.test(r[0])) return;
+      if (sub === 'ls' && same(r, ['--filter', `label=${LABEL_KEY}=1`, '--format', `{{.Name}}\t{{.Label "${LABEL_HOST}"}}\t{{.Label "${LABEL_PID}"}}\t{{.Label "${LABEL_TOKEN}"}}\t{{.Label "${LABEL_KEY}"}}`])) return;
+      break;
     }
     case 'port':
       if (same(rest, [ownName, '5432/tcp'])) return;
@@ -129,6 +170,11 @@ export function checkDockerArgs(args: string[], ownName: string): void {
       }
       if (rest[i] !== ownName) break;
       const program = rest[i + 1];
+      if (program === 'bash') {
+        // The one shell command the tool sends: the relay that carries a TCP connection to the server in the container.
+        if (same(rest.slice(i + 1), ['bash', '-c', RELAY_SCRIPT]) && i === 1) return; // exactly: exec -i NAME bash -c SCRIPT
+        throw new DockerGuardError('exec may run bash only with the relay script');
+      }
       if (!program || !EXEC_PROGRAMS.has(program)) throw new DockerGuardError(`exec may run only ${[...EXEC_PROGRAMS].join(', ')}, not "${program}"`);
       return;
     }
@@ -159,11 +205,12 @@ export function dockerSpawn(args: string[], ownName: string, env: Record<string,
  * Starts a detached watchdog that removes the container when this process is gone (including kill -9) or when the
  * container is gone already. The script is fixed text; the name must have the tool's shape.
  */
-export function startWatchdog(name: string, pid: number): void {
+export function startWatchdog(name: string, pid: number, net?: string): void {
   if (!parseContainerName(name)) throw new DockerGuardError('watchdog: bad container name');
+  if (net !== undefined && net !== netNameFor(name)) throw new DockerGuardError('watchdog: bad network name');
   const script =
     'while kill -0 "$1" 2>/dev/null && docker inspect --format "{{.State.Running}}" "$2" >/dev/null 2>&1; do sleep 2; done; ' +
-    'docker rm -f -v "$2" >/dev/null 2>&1';
-  const child = spawn('sh', ['-c', script, 'sh', String(pid), name], { detached: true, stdio: 'ignore' });
+    'docker rm -f -v "$2" >/dev/null 2>&1; if [ -n "$3" ]; then docker network rm "$3" >/dev/null 2>&1; fi';
+  const child = spawn('sh', ['-c', script, 'sh', String(pid), name, net ?? ''], { detached: true, stdio: 'ignore' });
   child.unref();
 }

@@ -124,6 +124,16 @@ function runCli(extra: string[], opts: { dir?: string; admin?: boolean } = {}): 
 const docker = (args: string[]): string => spawnSync('docker', args, { encoding: 'utf8' }).stdout.trim();
 const sandboxContainers = (): string[] => docker(['ps', '-a', '--format', '{{.Names}}', '--filter', 'name=rls-saboteur-sandbox-']).split('\n').filter(Boolean);
 const volumes = (): string => docker(['volume', 'ls', '-q']).split('\n').sort().join('\n');
+const networks = (): string[] => docker(['network', 'ls', '--format', '{{.Name}}', '--filter', 'name=rls-saboteur-sandbox-net-']).split('\n').filter(Boolean);
+
+/** How many data files of the connected database contain this text. Needs the cluster to be the matrix container. */
+async function filesHolding(c: pg.Client, needle: string): Promise<number | null> {
+  await c.query('checkpoint');
+  const oid = (await c.query(`select oid::text as o from pg_database where datname = current_database()`)).rows[0].o;
+  const container = process.env.SABOTEUR_MATRIX_CONTAINER ?? `rls-saboteur-ci-${Number(new URL(superUrl!).port) - 55400}`;
+  const r = spawnSync('docker', ['exec', container, 'sh', '-c', `grep -rlF '${needle}' /var/lib/postgresql/data/base/${oid} | wc -l`], { encoding: 'utf8' });
+  return r.status === 0 ? Number(r.stdout.trim()) : null;
+}
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 async function until(fn: () => boolean, ms: number): Promise<boolean> {
@@ -176,7 +186,7 @@ describe.skipIf(!superUrl)('build modes', () => {
       await c.query('analyze people');
       expect(Number((await c.query(`select count(*) as n from pg_stats_ext where tablename = 'people' and most_common_vals::text ~ 'real-'`)).rows[0].n), 'extended statistics hold real values before masking').toBeGreaterThan(0);
       const oid = (await c.query(`select oid::text as o from pg_database where datname = current_database()`)).rows[0].o;
-      const container = `rls-saboteur-ci-${Number(new URL(superUrl!).port) - 55400}`;
+      const container = process.env.SABOTEUR_MATRIX_CONTAINER ?? `rls-saboteur-ci-${Number(new URL(superUrl!).port) - 55400}`;
       const filesHolding = async (needle: string): Promise<number | null> => {
         await c.query('checkpoint');
         const r = spawnSync('docker', ['exec', container, 'sh', '-c', `grep -rlF '${needle}' /var/lib/postgresql/data/base/${oid} | wc -l`], { encoding: 'utf8' });
@@ -213,6 +223,38 @@ describe.skipIf(!superUrl)('build modes', () => {
       if (filesBefore !== null) {
         expect(await filesHolding('CANARY Alice'), 'a data file still holds a real value').toBe(0);
         expect(await filesHolding('private note'), 'a data file still holds a real note').toBe(0);
+      }
+    } finally {
+      await c.end();
+    }
+  });
+
+  it('mask-inherit: rows, statistics and files of inheritance children and partitions are cleaned too', async () => {
+    await makeSource();
+    const c = await open(urlFor(DB));
+    try {
+      await c.query(`create table parent_t (id serial primary key, email text not null);
+        create table child_t (extra text) inherits (parent_t);
+        create table pt (id int, email text) partition by range (id);
+        create table pt1 partition of pt for values from (0) to (100);
+        insert into parent_t(email) values ('p-real@corp.example');
+        insert into child_t(email, extra) values ('c-real-1@corp.example','x'),('c-real-2@corp.example','y');
+        insert into pt values (1,'part-real-1@corp.example'),(2,'part-real-2@corp.example');
+        analyze parent_t; analyze child_t; analyze pt; analyze pt1;`);
+      const statsHolding = async (): Promise<number> =>
+        Number((await c.query(`select count(*) as n from pg_stats where tablename in ('parent_t','child_t','pt','pt1') and attname = 'email' and histogram_bounds::text ~ 'real'`)).rows[0].n);
+      expect(await statsHolding(), 'child statistics hold real values before masking').toBeGreaterThan(0);
+      const before = await filesHolding(c, 'c-real-1@corp');
+      const db = { query: (t: string, v?: unknown[]) => c.query(t, v), end: async () => {} };
+      const out = await applyMasks(db, ['public.parent_t.email', 'public.pt.email'].map(parseMask), 'test-salt');
+      expect(out.map((x) => x.rows)).toEqual([3, 2]); // the child's rows were reached by the UPDATE
+      const live = await c.query(`select email from parent_t union all select email from pt`);
+      expect(live.rows.every((r) => /^[0-9a-f]{32}$/.test(r.email))).toBe(true);
+      expect(await statsHolding(), 'a child or partition still has real values in its statistics').toBe(0);
+      if (before !== null) {
+        expect(before, 'the data files hold the real values before masking').toBeGreaterThan(0);
+        expect(await filesHolding(c, 'c-real-1@corp'), 'a child data file still holds a real value').toBe(0);
+        expect(await filesHolding(c, 'part-real-1@corp'), 'a partition data file still holds a real value').toBe(0);
       }
     } finally {
       await c.end();
@@ -311,6 +353,7 @@ describe.skipIf(!superUrl || !image)('sandbox', () => {
     expect(r.observed).not.toMatch(/CANARY|corp\.example/);
     expect(r.json?.isolation).toBe('sandbox');
     expect(sandboxContainers()).toEqual([]);
+    expect(networks()).toEqual([]);
     expect(volumes()).toBe(vols);
     expect(await sourceFingerprint()).toBe(before);
     expect(await leftovers()).toEqual([]); // nothing was created on the source's server either
@@ -378,17 +421,80 @@ exit 0
     for (const l of lines) expect(l.endsWith(' 0'), l).toBe(true); // the seed's call and the test's call both did nothing
   });
 
+  it('sandbox-isolated: in --from-files mode a migration cannot reach the host or the internet, and no port is published', async () => {
+    await makeSource();
+    const port = new URL(superUrl!).port;
+    const dir = join(scratch, 'isoproj');
+    cpSync(project, dir, { recursive: true });
+    const probe = (target: string): string => `copy reach_tmp from program 'timeout 4 bash -c "exec 3<>/dev/tcp/${target} && echo CONNECTED" 2>/dev/null || echo BLOCKED';`;
+    writeFileSync(
+      join(dir, 'supabase', 'migrations', '20260101000001_reach.sql'),
+      `create table public.reach (what text, result text);
+create temp table reach_tmp (r text);
+${probe(`host.docker.internal/${port}`)}
+insert into public.reach select 'host.docker.internal', r from reach_tmp; truncate reach_tmp;
+${probe(`172.17.0.1/${port}`)}
+insert into public.reach select 'docker-bridge-gateway', r from reach_tmp; truncate reach_tmp;
+${probe('1.1.1.1/443')}
+insert into public.reach select 'internet', r from reach_tmp;\n`
+    );
+    writeFileSync(
+      join(dir, 'observe.sh'),
+      `#!/bin/sh
+set -e
+c=$(docker ps --format '{{.Names}}' --filter name=rls-saboteur-sandbox- | head -1)
+{
+  psql -X -At "$DATABASE_URL" -c "select 'reach ' || what || ' ' || result from reach order by 1"
+  echo "inspect $(docker inspect --format '{{.HostConfig.NetworkMode}} ports={{json .HostConfig.PortBindings}} hosts={{json .HostConfig.ExtraHosts}}' "$c")"
+} >> "$OBSERVE_FILE"
+exit 0
+`,
+      { mode: 0o755 }
+    );
+    const r = runCli(sbArgs(['--from-files']), { dir, admin: false });
+    expect(r.status, r.out).toBe(1);
+    expect(r.out).toContain('no route to your machine or to the internet');
+    const lines = r.observed.split('\n').filter(Boolean);
+    for (const what of ['host.docker.internal', 'docker-bridge-gateway', 'internet']) expect(lines).toContain(`reach ${what} BLOCKED`);
+    expect(lines.some((l) => /^reach .* CONNECTED/.test(l))).toBe(false);
+    const inspect = lines.find((l) => l.startsWith('inspect '))!;
+    expect(inspect).toMatch(/^inspect rls-saboteur-sandbox-net-[0-9a-f]{12}-\d+-[0-9a-f]{16} ports=\{\} hosts=null/);
+    // Control: the same probe on the default network DOES connect to the host, so the test above can fail.
+    const control = spawnSync('docker', ['run', '--rm', '--add-host', 'host.docker.internal:host-gateway', image!, 'bash', '-c', `timeout 4 bash -c "exec 3<>/dev/tcp/host.docker.internal/${port} && echo CONNECTED" 2>/dev/null || echo BLOCKED`], { encoding: 'utf8' });
+    expect(control.stdout.trim()).toBe('CONNECTED');
+    expect(networks()).toEqual([]);
+  });
+
   it('sandbox-dump: the rows are streamed into the container, masked there, and the source is unchanged', async () => {
     await makeSource();
     const before = await sourceFingerprint();
-    const r = runCli(sbArgs(['--mask', 'public.people.email', '--mask', 'public.people.full_name', '--mask', 'public.people.note=null']), { admin: false });
+    const r = runCli(sbArgs(['--mask', 'public.people.email', '--mask', 'public.people.full_name', '--mask', 'public.people.note=null', '--mask', 'public.orders.buyer_email']), { admin: false });
     expect(r.status, r.out).toBe(1);
-    expect(r.out).toContain('streamed into it with pg_dump');
+    expect(r.out).toContain('pg_dump runs in it');
     expect(r.observed).toMatch(/people\|1\|[0-9a-f]{32}\|/);
     expect(r.observed).not.toMatch(/CANARY|real-alice/);
     expect(r.observed).toContain('90000'); // passport numbers were not masked, so the dump did bring the rows
     expect(sandboxContainers()).toEqual([]);
     expect(await sourceFingerprint()).toBe(before);
+  });
+
+  it('sandbox-dump-triggers: no trigger fires while the dump is loaded', async () => {
+    await makeSource();
+    const dir = join(scratch, 'triggerproj');
+    cpSync(project, dir, { recursive: true });
+    const s = await open(urlFor(DB));
+    await s.query(`create table public.audit (n serial primary key, who text);
+      create function public.audit_fn() returns trigger language plpgsql as $$ begin insert into public.audit(who) values (new.email); return new; end $$;
+      create trigger people_audit after insert on public.people for each row execute function public.audit_fn();
+      insert into public.people (email, full_name, tenant_id) values ('trigger-row@corp.example', 'T', 't1');`);
+    const sourceRows = Number((await s.query('select count(*) as n from public.audit')).rows[0].n);
+    await s.end();
+    expect(sourceRows).toBe(1);
+    writeFileSync(join(dir, 'observe.sh'), `#!/bin/sh\nset -e\necho "audit $(psql -X -At "$DATABASE_URL" -c 'select count(*) from public.audit')" >> "$OBSERVE_FILE"\nexit 0\n`, { mode: 0o755 });
+    const r = runCli(sbArgs([]), { dir, admin: false });
+    expect(r.status, r.out).toBe(1);
+    // The audit row is data and is dumped once. A trigger firing on the load would make it two.
+    for (const l of r.observed.split('\n').filter(Boolean)) expect(l).toBe('audit 1');
   });
 
   it('sandbox-unmasked-dump: without --mask a dump copy holds the rows, which is what the plan says', async () => {
@@ -409,7 +515,7 @@ exit 0
     await sleep(3000); // let it get past the build
     child.kill('SIGKILL');
     // No handler can run after SIGKILL. The detached watchdog removes the container.
-    expect(await until(() => sandboxContainers().length === 0, 30_000)).toBe(true);
+    expect(await until(() => sandboxContainers().length === 0 && networks().length === 0, 30_000)).toBe(true);
   });
 
   for (const sig of ['SIGINT', 'SIGTERM'] as const) {
@@ -424,6 +530,7 @@ exit 0
       child.kill(sig);
       expect(await exited).toBe(sig === 'SIGINT' ? 130 : 143);
       expect(sandboxContainers()).toEqual([]);
+      expect(networks()).toEqual([]);
     });
   }
 
@@ -439,6 +546,14 @@ exit 0
     const ofDead = mk(hostId(), dead, 'a'.repeat(16));
     const ofLive = mk(hostId(), String(process.pid), 'b'.repeat(16));
     const ofOther = mk('c'.repeat(12), dead, 'd'.repeat(16));
+    const mkNet = (host: string, pid: string, token: string): string => {
+      const name = `rls-saboteur-sandbox-net-${host}-${pid}-${token}`;
+      const r = spawnSync('docker', ['network', 'create', '--internal', '--label', 'rls-saboteur.sandbox=1', '--label', `rls-saboteur.host=${host}`, '--label', `rls-saboteur.pid=${pid}`, '--label', `rls-saboteur.token=${token}`, name], { encoding: 'utf8' });
+      expect(r.status, r.stderr).toBe(0);
+      return name;
+    };
+    const netDead = mkNet(hostId(), dead, 'a'.repeat(16));
+    const netLive = mkNet(hostId(), String(process.pid), 'b'.repeat(16));
     try {
       const r = runCli(sbArgs(['--from-files']), { admin: false });
       expect(r.status, r.out).toBe(1);
@@ -446,8 +561,11 @@ exit 0
       expect(left).not.toContain(ofDead);
       expect(left).toContain(ofLive);
       expect(left).toContain(ofOther);
+      expect(networks()).not.toContain(netDead);
+      expect(networks()).toContain(netLive);
     } finally {
       for (const c of [ofDead, ofLive, ofOther]) docker(['rm', '-f', '-v', c]);
+      for (const n of [netDead, netLive]) docker(['network', 'rm', n]);
     }
   });
 });

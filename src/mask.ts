@@ -132,6 +132,19 @@ export const STATS_SQL = `select (
       where s.schemaname = $1 and s.tablename = $2 and u.v in (select v::text from _sab_mask))
   )::int as n`;
 
+/**
+ * The table and every table below it: legacy inheritance children and declarative partitions, at any depth.
+ * An UPDATE through the parent rewrites rows in all of them, so each one needs its own VACUUM and statistics check.
+ */
+export const TREE_SQL = `with recursive t as (
+    select c.oid, n.nspname::text as schema, c.relname::text as name, c.relkind::text as kind
+      from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = $1 and c.relname = $2
+    union
+    select c.oid, n.nspname::text, c.relname::text, c.relkind::text
+      from pg_inherits i join t on i.inhparent = t.oid
+      join pg_class c on c.oid = i.inhrelid join pg_namespace n on n.oid = c.relnamespace)
+  select schema, name, kind from t order by (oid = (select oid from t limit 1)) desc, schema, name`;
+
 export interface MaskedColumn {
   column: string;
   strategy: MaskStrategy;
@@ -155,6 +168,12 @@ export async function applyMasks(db: Db, masks: MaskSpec[], salt: string = rando
     if (why) throw new Error(`masking stopped: ${why}`);
     const tbl = `${qi(m.schema)}.${qi(m.table)}`;
     const col = qi(m.column);
+    const tree = (await db.query(TREE_SQL, [m.schema, m.table])).rows as { schema: string; name: string; kind: string }[];
+    const odd = tree.filter((t) => t.kind !== 'r' && t.kind !== 'p');
+    if (odd.length) {
+      // An UPDATE through the parent would be sent to a foreign table's server, or hit a kind of relation that is not rewritten here.
+      throw new Error(`masking stopped: ${label} has below it ${odd.map((t) => `${t.schema}.${t.name} (relkind ${t.kind})`).join(', ')}, which cannot be masked and cleaned safely`);
+    }
     // The snapshot lives for the whole column, past the commit, so the statistics can be checked against it.
     await db.query('drop table if exists pg_temp._sab_mask');
     try {
@@ -187,10 +206,19 @@ export async function applyMasks(db: Db, masks: MaskSpec[], salt: string = rando
       // The rewrite leaves the old values in dead rows, in index pages and in the planner statistics (pg_statistic holds
       // sample values and histogram bounds). A copy is made from these files, so all three must go before any copy.
       // VACUUM cannot run in a transaction.
-      await db.query(`vacuum (full, analyze) ${tbl}`);
-      const stats = Number((await db.query(STATS_SQL, [m.schema, m.table, m.column])).rows[0].n);
-      if (stats !== 0) {
-        throw new Error(`${stats} original value(s) of ${label} are still in the planner statistics (pg_stats, pg_stats_ext) after VACUUM FULL and ANALYZE`);
+      for (const t of tree) {
+        const member = `${qi(t.schema)}.${qi(t.name)}`;
+        // A partitioned table holds no rows itself: ANALYZE it, and clean each partition on its own line of this loop.
+        await db.query(t.kind === 'p' ? `analyze ${member}` : `vacuum (full, analyze) ${member}`);
+      }
+      // ANALYZE replaced the statistics rows. The old versions are dead rows in the catalog tables until they are rewritten too.
+      await db.query('vacuum (full) pg_catalog.pg_statistic');
+      await db.query('vacuum (full) pg_catalog.pg_statistic_ext_data');
+      for (const t of tree) {
+        const stats = Number((await db.query(STATS_SQL, [t.schema, t.name, m.column])).rows[0].n);
+        if (stats !== 0) {
+          throw new Error(`${stats} original value(s) of ${label} are still in the planner statistics of ${t.schema}.${t.name} (pg_stats, pg_stats_ext) after VACUUM FULL and ANALYZE`);
+        }
       }
     } catch (e) {
       throw new Error(`masking ${label} failed, so the run stops before any test: ${(e as Error).message}`);

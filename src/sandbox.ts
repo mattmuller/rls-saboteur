@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import net from 'node:net';
 import { withDatabase } from './config.js';
 import {
   CONTAINER_PREFIX,
@@ -6,7 +7,10 @@ import {
   LABEL_KEY,
   LABEL_PID,
   LABEL_TOKEN,
+  RELAY_SCRIPT,
   containerNameFor,
+  netNameFor,
+  removableNetwork,
   docker,
   dockerSpawn,
   removableContainer,
@@ -33,6 +37,8 @@ import { scrubSecrets } from './config.js';
 
 export interface Sandbox {
   name: string;
+  /** True when the container is on an internal network: no route to this machine or the internet. */
+  isolated: boolean;
   port: number;
   user: string;
   password: string;
@@ -62,41 +68,105 @@ export function sweepContainers(token: string, own: string): string[] {
     if (!ok.ok) continue;
     if (docker(['rm', '-f', '-v', name], own).code === 0) removed.push(name);
   }
+  const nets = docker(
+    ['network', 'ls', '--filter', `label=${LABEL_KEY}=1`, '--format', `{{.Name}}\t{{.Label "${LABEL_HOST}"}}\t{{.Label "${LABEL_PID}"}}\t{{.Label "${LABEL_TOKEN}"}}\t{{.Label "${LABEL_KEY}"}}`],
+    own
+  );
+  if (nets.code === 0) {
+    for (const l of lines(nets.stdout)) {
+      const [name, host, pid, tok, key] = l.split('\t');
+      const ok = removableNetwork(name, { [LABEL_KEY]: key, [LABEL_HOST]: host, [LABEL_PID]: pid, [LABEL_TOKEN]: tok }, token);
+      if (ok.ok) docker(['network', 'rm', name], own);
+    }
+  }
   return removed;
 }
 
-export async function startSandbox(image: string, token: string): Promise<Sandbox> {
+/** Carries TCP connections from this machine to the server inside an isolated container, one `docker exec` each. */
+function startRelay(name: string): Promise<{ port: number; close(): void }> {
+  const children = new Set<ReturnType<typeof dockerSpawn>>();
+  const server = net.createServer((sock) => {
+    const ch = dockerSpawn(['exec', '-i', name, 'bash', '-c', RELAY_SCRIPT], name);
+    children.add(ch);
+    const end = (): void => {
+      sock.destroy();
+      ch.kill();
+      children.delete(ch);
+    };
+    ch.stdin?.on('error', () => {});
+    ch.stdout?.on('error', () => {});
+    sock.on('error', end);
+    sock.on('close', end);
+    ch.on('error', end);
+    ch.on('close', end);
+    sock.pipe(ch.stdin!);
+    ch.stdout!.pipe(sock);
+  });
+  return new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      resolve({
+        port: (server.address() as net.AddressInfo).port,
+        close: () => {
+          server.close();
+          for (const c of children) c.kill();
+        }
+      });
+    });
+  });
+}
+
+export async function startSandbox(image: string, token: string, isolated = false): Promise<Sandbox> {
   const name = containerNameFor(hostId(), process.pid, token);
   const v = docker(['ps', '-a', '--filter', `label=${LABEL_KEY}=1`, '--format', `{{.Names}}\t{{.Label "${LABEL_HOST}"}}\t{{.Label "${LABEL_PID}"}}\t{{.Label "${LABEL_TOKEN}"}}\t{{.Label "${LABEL_KEY}"}}`], name);
   if (v.code !== 0) throw new Error(`Docker is not available (${scrubSecrets(v.stderr.trim() || 'no answer from the docker command', [])}). Sandbox mode needs a running Docker.`);
   sweepContainers(token, name);
 
+  const labels = ['--label', `${LABEL_KEY}=1`, '--label', `${LABEL_HOST}=${hostId()}`, '--label', `${LABEL_PID}=${process.pid}`, '--label', `${LABEL_TOKEN}=${token}`];
+  const netName = isolated ? netNameFor(name) : undefined;
   const password = randomBytes(18).toString('hex');
+  let relay: { port: number; close(): void } | undefined;
+  const remove = async (): Promise<boolean> => {
+    relay?.close();
+    docker(['rm', '-f', '-v', name], name);
+    let gone = docker(['inspect', '--format', '{{.State.Running}}', name], name).code !== 0; // inspect fails once the container is gone
+    if (netName) {
+      for (let i = 0; i < 10; i++) {
+        docker(['network', 'rm', netName], name);
+        const ls = docker(['network', 'ls', '--filter', `label=${LABEL_KEY}=1`, '--format', `{{.Name}}\t{{.Label "${LABEL_HOST}"}}\t{{.Label "${LABEL_PID}"}}\t{{.Label "${LABEL_TOKEN}"}}\t{{.Label "${LABEL_KEY}"}}`], name);
+        if (!ls.stdout.includes(netName)) break;
+        if (i === 9) gone = false;
+        await new Promise((r) => setTimeout(r, 300));
+      }
+    }
+    return gone;
+  };
+  if (netName) {
+    const mk = docker(['network', 'create', '--internal', ...labels, netName], name);
+    if (mk.code !== 0) throw new Error(`Could not create the internal Docker network: ${mk.stderr.trim().split('\n').slice(-2).join(' ')}`);
+  }
   const run = docker(
     [
-      'run', '-d', '--rm', '--name', name,
-      '--label', `${LABEL_KEY}=1`, '--label', `${LABEL_HOST}=${hostId()}`, '--label', `${LABEL_PID}=${process.pid}`, '--label', `${LABEL_TOKEN}=${token}`,
-      '-e', 'POSTGRES_PASSWORD', '-p', '127.0.0.1::5432', '--add-host', 'host.docker.internal:host-gateway', image
+      'run', '-d', '--rm', '--name', name, ...labels, '-e', 'POSTGRES_PASSWORD',
+      ...(netName ? ['--network', netName] : ['-p', '127.0.0.1::5432', '--add-host', 'host.docker.internal:host-gateway']),
+      image
     ],
     name,
     { POSTGRES_PASSWORD: password },
     600_000
   );
   if (run.code !== 0) {
-    docker(['rm', '-f', '-v', name], name);
+    await remove();
     throw new Error(`Could not start the sandbox container from image "${image}": ${run.stderr.trim().split('\n').slice(-3).join(' ')}`);
   }
-  startWatchdog(name, process.pid);
-  const remove = async (): Promise<boolean> => {
-    docker(['rm', '-f', '-v', name], name);
-    const left = docker(['inspect', '--format', '{{.State.Running}}', name], name);
-    return left.code !== 0; // inspect fails once the container is gone
-  };
+  startWatchdog(name, process.pid, netName);
   try {
-    const port = readPort(name);
+    relay = netName ? await startRelay(name) : undefined;
+    const port = relay ? relay.port : readPort(name);
     const user = await waitReady(port, password, name);
     return {
       name,
+      isolated,
       port,
       user,
       password,
@@ -264,7 +334,7 @@ export interface SandboxIsolationOptions {
 
 export async function createSandboxIsolation(o: SandboxIsolationOptions): Promise<Isolation> {
   const token = newToken();
-  const sb = await startSandbox(o.image, token);
+  const sb = await startSandbox(o.image, token, o.files !== null);
   let signalled = false;
   const onSignal = (sig: NodeJS.Signals): void => {
     if (signalled) return;
@@ -318,7 +388,9 @@ export async function createSandboxIsolation(o: SandboxIsolationOptions): Promis
       }
     });
     const notes = [
-      `Sandbox: the copies live in the container ${sb.name} (image ${o.image}), on 127.0.0.1:${sb.port}. The container is removed when the run ends.`,
+      `Sandbox: the copies live in the container ${sb.name} (image ${o.image}), reached on 127.0.0.1:${sb.port}. ` +
+        (sb.isolated ? 'The container sits on an internal Docker network: it has no route to this machine or to the internet. ' : 'The container is on the default Docker network, so it can reach this machine and the internet. ') +
+        'The container is removed when the run ends.',
       ...iso.notes
     ];
     let disposed = false;

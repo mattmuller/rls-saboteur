@@ -82,7 +82,7 @@ export interface RunOutput {
 /** Why --from-files needs --sandbox. The migration and seed files are your code and can do anything their role can. */
 export const FILES_NEED_SANDBOX =
   '--from-files needs --sandbox. Migration and seed files are your code: on your own server they would run with the rights of your database user ' +
-  'and could change roles or other databases there. In a sandbox container they can only reach the container.';
+  'and could change roles or other databases there. In a sandbox container on an internal Docker network (no route to your machine or to the internet) they can only reach the container.';
 
 export async function run(o: RunOptions): Promise<RunOutput> {
   if (o.buildFiles && !o.sandbox) throw new Error(FILES_NEED_SANDBOX);
@@ -383,14 +383,16 @@ export function modeLines(o: Pick<RunOptions, 'buildFiles' | 'sandbox' | 'sandbo
   if (o.buildFiles) {
     out.push(
       `Copies: built from ${visible(o.buildFiles.description)}. No row of this database is copied. ` +
-        `Those files are your code: they run as the superuser of the container, which can reach the network, and not on your server. ` +
-        `Outbound HTTP is switched off after each file, so a call inside the same file that installs the extension is not stopped.`
+        `Those files are your code: they run as the superuser of the container, not on your server. ` +
+        `Outbound HTTP functions are also switched off after each file, as a second layer.`
     );
   }
   if (o.sandbox) {
     out.push(
-      `Sandbox: the copies live in a Docker container (image ${visible(o.sandboxImage ?? 'postgres:<version of the source>')}, pulled if it is not here), reachable on 127.0.0.1 only. The container is removed when the run ends.` +
-        (o.buildFiles ? '' : ' The rows of this database are streamed into it with pg_dump, in a read-only session.')
+      `Sandbox: the copies live in a Docker container (image ${visible(o.sandboxImage ?? 'postgres:<version of the source>')}, pulled if it is not here). The container is removed when the run ends.` +
+        (o.buildFiles
+          ? ' It sits on an internal Docker network: no route to your machine or to the internet, and no port is published. This tool reaches it through docker exec. Your files run inside it as the container superuser, so they can only reach the container.'
+          : ' It sits on the default Docker network and is reachable on 127.0.0.1 only. pg_dump runs in it and reads your database in a read-only session, so the container can reach your machine and the internet. Nothing of yours runs there except the SQL restored from your own database, with triggers off.')
     );
   }
   if (o.masks?.length) {
