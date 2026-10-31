@@ -451,8 +451,10 @@ ${probe(`127.0.0.1/${port}`)}
 insert into public.reach select 'own-loopback-on-the-host-port', r from reach_tmp; truncate reach_tmp;
 ${probe('1.1.1.1/443')}
 insert into public.reach select 'internet', r from reach_tmp; truncate reach_tmp;
-copy reach_tmp from program 'cat /proc/net/dev | tail -n +3 | cut -d: -f1 | tr -d " "';
-insert into public.reach select 'interface', r from reach_tmp;\n`
+copy reach_tmp from program 'tail -n +2 /proc/net/route | wc -l | tr -d " "';
+insert into public.reach select 'routes', r from reach_tmp; truncate reach_tmp;
+copy reach_tmp from program 'grep -B1 "host LOCAL" /proc/net/fib_trie | grep -oE "[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+" | sort -u';
+insert into public.reach select 'ipv4-address', r from reach_tmp;\n`
     );
     writeFileSync(
       join(dir, 'observe.sh'),
@@ -473,8 +475,12 @@ exit 0
     const lines = r.observed.split('\n').filter(Boolean);
     for (const what of ['host.docker.internal', 'docker-bridge-gateway', 'own-loopback-on-the-host-port', 'internet']) expect(lines).toContain(`reach ${what} BLOCKED`);
     expect(lines.some((l) => /^reach .* CONNECTED/.test(l))).toBe(false);
-    // The only network interface is loopback.
-    expect(lines.filter((l) => l.startsWith('reach interface '))).toEqual(['reach interface lo']);
+    // No route at all, and no IPv4 address except loopback. (Linux still lists a few fallback tunnel devices in a new network
+    // namespace, all down and without an address, so the interface list itself proves nothing.)
+    expect(lines).toContain('reach routes 0');
+    const addrs = lines.filter((l) => l.startsWith('reach ipv4-address ')).map((l) => l.split(' ')[2]);
+    expect(addrs.length).toBeGreaterThan(0);
+    expect(addrs.every((a) => a.startsWith('127.'))).toBe(true);
     expect(lines.find((l) => l.startsWith('inspect '))).toMatch(/^inspect none ports=\{\} hosts=null/);
     // Control: the same probe on the default network DOES connect to the host, so the test above can fail.
     const control = spawnSync('docker', ['run', '--rm', '--add-host', 'host.docker.internal:host-gateway', image!, 'bash', '-c', `timeout 4 bash -c "exec 3<>/dev/tcp/host.docker.internal/${port} && echo CONNECTED" 2>/dev/null || echo BLOCKED`], { encoding: 'utf8' });
