@@ -12,14 +12,12 @@ import {
   LABEL_KEY,
   LABEL_PID,
   LABEL_TOKEN,
-  RELAY_SCRIPT,
-  netNameFor,
-  removableNetwork
+  RELAY_SCRIPT
 } from '../src/docker.js';
 import { applyMasks, maskText, parseMask, scrambleExpr, validateMasks } from '../src/mask.js';
 import { discoverBuildFiles, pgCronHint } from '../src/files.js';
 import { modeLines, policyDifferences, sandboxImageFor } from '../src/run.js';
-import { containerHostFor, dumpEnvFor, rolesScript } from '../src/sandbox.js';
+import { assertAuthEnforced, containerHostFor, dumpEnvFor, rolesScript } from '../src/sandbox.js';
 import type { Db } from '../src/guard.js';
 import type { Policy } from '../src/types.js';
 
@@ -53,33 +51,31 @@ describe('docker guard', () => {
   const name = containerNameFor(hostId(), process.pid, token);
   const labels = ['--label', `${LABEL_KEY}=1`, '--label', `${LABEL_HOST}=${hostId()}`, '--label', `${LABEL_PID}=${process.pid}`, '--label', `${LABEL_TOKEN}=${token}`];
   const runArgs = (extra: string[] = [], image = 'postgres:17'): string[] => [
-    'run', '-d', '--rm', '--name', name, ...labels, '-e', 'POSTGRES_PASSWORD', '-p', '127.0.0.1::5432', '--add-host', 'host.docker.internal:host-gateway', image, ...extra
+    'run', '-d', '--rm', '--name', name, ...labels, '-e', 'POSTGRES_PASSWORD', '-e', 'POSTGRES_INITDB_ARGS', '-p', '127.0.0.1::5432', '--add-host', 'host.docker.internal:host-gateway', image, ...extra
   ];
   it('docker guard: allows the one container shape the tool starts', () => {
     expect(() => checkDockerArgs(runArgs(), name)).not.toThrow();
     expect(() => checkDockerArgs(['port', name, '5432/tcp'], name)).not.toThrow();
     expect(() => checkDockerArgs(['rm', '-f', '-v', name], name)).not.toThrow();
   });
-  it('docker guard: allows the isolated shape and its network, and nothing else on the network verb', () => {
-    const net = netNameFor(name);
-    const isolatedRun = ['run', '-d', '--rm', '--name', name, ...labels, '-e', 'POSTGRES_PASSWORD', '--network', net, 'postgres:17'];
-    expect(() => checkDockerArgs(isolatedRun, name)).not.toThrow();
-    expect(() => checkDockerArgs(['network', 'create', '--internal', ...labels, net], name)).not.toThrow();
-    expect(() => checkDockerArgs(['network', 'rm', net], name)).not.toThrow();
-    // Not internal, another network name, host or bridge networking, a published port or a host mapping on the isolated shape.
-    expect(() => checkDockerArgs(['network', 'create', ...labels, net], name)).toThrow(DockerGuardError);
-    expect(() => checkDockerArgs(['network', 'create', '--internal', ...labels, 'other'], name)).toThrow(DockerGuardError);
-    expect(() => checkDockerArgs(['network', 'rm', 'bridge'], name)).toThrow(DockerGuardError);
-    expect(() => checkDockerArgs(['network', 'connect', net, name], name)).toThrow(DockerGuardError);
-    for (const bad of ['host', 'bridge', 'none', 'rls-saboteur-sandbox-net-aaaaaaaaaaaa-1-bbbbbbbbbbbbbbbb']) {
-      expect(() => checkDockerArgs(isolatedRun.map((x) => (x === net ? bad : x)), name), bad).toThrow(DockerGuardError);
+  it('docker guard: the files shape has no network at all, and nothing else is accepted in its place', () => {
+    const none = ['run', '-d', '--rm', '--name', name, ...labels, '-e', 'POSTGRES_PASSWORD', '-e', 'POSTGRES_INITDB_ARGS', '--network', 'none', 'postgres:17'];
+    expect(() => checkDockerArgs(none, name)).not.toThrow();
+    for (const bad of ['host', 'bridge', 'rls-saboteur-x', 'container:other']) {
+      expect(() => checkDockerArgs(none.map((x) => (x === 'none' ? bad : x)), name), bad).toThrow(DockerGuardError);
     }
-    const withPort = [...isolatedRun];
+    const withPort = [...none];
     withPort.splice(withPort.indexOf('--network'), 0, '-p', '127.0.0.1::5432');
     expect(() => checkDockerArgs(withPort, name)).toThrow(DockerGuardError);
-    const withHost = [...isolatedRun];
+    const withHost = [...none];
     withHost.splice(withHost.indexOf('postgres:17'), 0, '--add-host', 'host.docker.internal:host-gateway');
     expect(() => checkDockerArgs(withHost, name)).toThrow(DockerGuardError);
+    // The password setting is part of the shape.
+    expect(() => checkDockerArgs(none.filter((x, i) => !(x === '-e' && none[i + 1] === 'POSTGRES_INITDB_ARGS') && x !== 'POSTGRES_INITDB_ARGS'), name)).toThrow(DockerGuardError);
+    // No network verb at all.
+    for (const v of [['network', 'create', 'x'], ['network', 'rm', 'bridge'], ['network', 'connect', 'bridge', name]]) {
+      expect(() => checkDockerArgs(v, name), v.join(' ')).toThrow(DockerGuardError);
+    }
   });
   it('docker guard: bash runs in the container only as the relay script', () => {
     expect(() => checkDockerArgs(['exec', '-i', name, 'bash', '-c', RELAY_SCRIPT], name)).not.toThrow();
@@ -168,7 +164,7 @@ describe('mask: parsing', () => {
 });
 
 /** A fake database that answers the mask queries. `s` controls what it says. */
-function fakeDb(s: { exists?: boolean; type?: string; before?: number; updated?: number; left?: number; noSuper?: boolean; statsLeft?: number; tree?: { schema: string; name: string; kind: string }[]; relkind?: string; generated?: string }): { db: Db; log: string[] } {
+function fakeDb(s: { exists?: boolean; type?: string; before?: number; updated?: number; left?: number; noSuper?: boolean; statsLeft?: number; parents?: string[]; tree?: { schema: string; name: string; kind: string }[]; relkind?: string; generated?: string }): { db: Db; log: string[] } {
   const log: string[] = [];
   const db: Db = {
     async end() {},
@@ -178,6 +174,7 @@ function fakeDb(s: { exists?: boolean; type?: string; before?: number; updated?:
         if (s.exists === false) return { rows: [], rowCount: 0 } as never;
         return { rows: [{ relkind: s.relkind ?? 'r', type: s.type ?? 'text', base: s.type ?? 'text', generated: s.generated ?? '', identity: '', maxlen: null }], rowCount: 1 } as never;
       }
+      if (/as parent\s+from pg_inherits/.test(text)) return { rows: (s.parents ?? []).map((parent) => ({ parent })), rowCount: 0 } as never;
       if (/with recursive t as/.test(text)) return { rows: s.tree ?? [{ schema: 'public', name: 'users', kind: 'r' }], rowCount: 1 } as never;
       if (/from pg_stats s/.test(text)) return { rows: [{ n: s.statsLeft ?? 0 }], rowCount: 1 } as never;
       if (/session_replication_role/.test(text) && s.noSuper) throw new Error('permission denied to set parameter');
@@ -236,6 +233,12 @@ describe('mask: it fails closed', () => {
     };
     await expect(applyMasks(db, [parseMask('public.parent.email')], 's')).rejects.toThrow(/planner statistics of public\.child/);
     expect(call).toBeGreaterThan(0);
+  });
+  it('mask-inherit: a table that has a parent cannot be masked on its own, and the plan check says so', async () => {
+    const { db, log } = fakeDb({ parents: ['public.parent'] });
+    await expect(applyMasks(db, [parseMask('public.child.email')], 's')).rejects.toThrow(/inherits from public\.parent.*Mask email on public\.parent/);
+    expect(log.some((l) => /^update/.test(l))).toBe(false);
+    expect((await validateMasks(fakeDb({ parents: ['public.parent'] }).db, [parseMask('public.child.email')]))[0]).toMatch(/inherits from public\.parent/);
   });
   it('mask-inherit: a foreign table below the masked one stops the run before anything is rewritten', async () => {
     const { db, log } = fakeDb({ tree: [{ schema: 'public', name: 'parent', kind: 'r' }, { schema: 'public', name: 'remote', kind: 'f' }] });
@@ -320,19 +323,15 @@ describe('plan lines and helpers', () => {
   });
   it('plan: files mode claims an isolated network, dump mode admits the container can reach out', () => {
     const files = { migrations: ['a.sql'], seed: null, description: '1 migration file(s)' };
-    expect(modeLines({ sandbox: true, buildFiles: files }).join(' ')).toMatch(/no route to your machine or to the internet/);
+    expect(modeLines({ sandbox: true, buildFiles: files }).join(' ')).toMatch(/no network at all/);
     expect(modeLines({ sandbox: true }).join(' ')).toMatch(/can reach your machine and the internet/);
   });
-  it('removableNetwork: follows the container rule', () => {
-    const host = 'aaaaaaaaaaaa';
-    const tok = 'b'.repeat(16);
-    const n = netNameFor(containerNameFor(host, 10, tok));
-    const l = { [LABEL_KEY]: '1', [LABEL_HOST]: host, [LABEL_PID]: '10', [LABEL_TOKEN]: tok };
-    expect(removableNetwork(n, l, tok, () => true, host).ok).toBe(true);
-    expect(removableNetwork(n, l, 'c'.repeat(16), () => true, host).ok).toBe(false); // live process
-    expect(removableNetwork(n, l, 'c'.repeat(16), () => false, host).ok).toBe(true); // dead process
-    expect(removableNetwork('bridge', l, tok, () => false, host).ok).toBe(false);
-    expect(removableNetwork(n, {}, tok, () => false, host).ok).toBe(false);
+  it('sandbox-auth: a server that lets a wrong password in stops the run, one that refuses it passes', async () => {
+    await expect(assertAuthEnforced((pw) => `postgres://u:${pw}@h/db`, async () => ({ end: async () => {} }))).rejects.toThrow(/wrong password/);
+    await expect(assertAuthEnforced((pw) => `postgres://u:${pw}@h/db`, async () => { throw new Error('password authentication failed'); })).resolves.toBeUndefined();
+    const seen: string[] = [];
+    await assertAuthEnforced((pw) => { seen.push(pw); return `postgres://u:${pw}@h/db`; }, async () => { throw new Error('no'); });
+    expect(seen[0]).toMatch(/^wrong-[0-9a-f]{16}$/);
   });
   it('plan: the new modes say what they do', () => {
     const files = { migrations: ['a.sql'], seed: null, description: '1 migration file(s)' };

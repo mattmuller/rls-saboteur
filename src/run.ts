@@ -82,7 +82,7 @@ export interface RunOutput {
 /** Why --from-files needs --sandbox. The migration and seed files are your code and can do anything their role can. */
 export const FILES_NEED_SANDBOX =
   '--from-files needs --sandbox. Migration and seed files are your code: on your own server they would run with the rights of your database user ' +
-  'and could change roles or other databases there. In a sandbox container on an internal Docker network (no route to your machine or to the internet) they can only reach the container.';
+  'and could change roles or other databases there. In a sandbox container that has no network at all they can only reach the container.';
 
 export async function run(o: RunOptions): Promise<RunOutput> {
   if (o.buildFiles && !o.sandbox) throw new Error(FILES_NEED_SANDBOX);
@@ -391,8 +391,8 @@ export function modeLines(o: Pick<RunOptions, 'buildFiles' | 'sandbox' | 'sandbo
     out.push(
       `Sandbox: the copies live in a Docker container (image ${visible(o.sandboxImage ?? 'postgres:<version of the source>')}, pulled if it is not here). The container is removed when the run ends.` +
         (o.buildFiles
-          ? ' It sits on an internal Docker network: no route to your machine or to the internet, and no port is published. This tool reaches it through docker exec. Your files run inside it as the container superuser, so they can only reach the container.'
-          : ' It sits on the default Docker network and is reachable on 127.0.0.1 only. pg_dump runs in it and reads your database in a read-only session, so the container can reach your machine and the internet. Nothing of yours runs there except the SQL restored from your own database, with triggers off.')
+          ? ' It has no network at all (docker --network none) and no published port. This tool reaches it through docker exec. Your files run inside it as the container superuser, so they can only reach the container.'
+          : ' It sits on the default Docker network and is reachable on 127.0.0.1 only. pg_dump runs in it and reads your database in a read-only session, so the container can reach your machine and the internet. Nothing of yours runs there except the SQL restored from your own database, with the triggers created after the data, so none fires.')
     );
   }
   if (o.masks?.length) {

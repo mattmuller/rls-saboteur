@@ -9,8 +9,6 @@ import {
   LABEL_TOKEN,
   RELAY_SCRIPT,
   containerNameFor,
-  netNameFor,
-  removableNetwork,
   docker,
   dockerSpawn,
   removableContainer,
@@ -37,7 +35,7 @@ import { scrubSecrets } from './config.js';
 
 export interface Sandbox {
   name: string;
-  /** True when the container is on an internal network: no route to this machine or the internet. */
+  /** True when the container has no network at all (--network none). This tool reaches it through docker exec. */
   isolated: boolean;
   port: number;
   user: string;
@@ -67,17 +65,6 @@ export function sweepContainers(token: string, own: string): string[] {
     const ok = removableContainer(name, { [LABEL_KEY]: key, [LABEL_HOST]: host, [LABEL_PID]: pid, [LABEL_TOKEN]: tok }, token);
     if (!ok.ok) continue;
     if (docker(['rm', '-f', '-v', name], own).code === 0) removed.push(name);
-  }
-  const nets = docker(
-    ['network', 'ls', '--filter', `label=${LABEL_KEY}=1`, '--format', `{{.Name}}\t{{.Label "${LABEL_HOST}"}}\t{{.Label "${LABEL_PID}"}}\t{{.Label "${LABEL_TOKEN}"}}\t{{.Label "${LABEL_KEY}"}}`],
-    own
-  );
-  if (nets.code === 0) {
-    for (const l of lines(nets.stdout)) {
-      const [name, host, pid, tok, key] = l.split('\t');
-      const ok = removableNetwork(name, { [LABEL_KEY]: key, [LABEL_HOST]: host, [LABEL_PID]: pid, [LABEL_TOKEN]: tok }, token);
-      if (ok.ok) docker(['network', 'rm', name], own);
-    }
   }
   return removed;
 }
@@ -123,47 +110,39 @@ export async function startSandbox(image: string, token: string, isolated = fals
   sweepContainers(token, name);
 
   const labels = ['--label', `${LABEL_KEY}=1`, '--label', `${LABEL_HOST}=${hostId()}`, '--label', `${LABEL_PID}=${process.pid}`, '--label', `${LABEL_TOKEN}=${token}`];
-  const netName = isolated ? netNameFor(name) : undefined;
   const password = randomBytes(18).toString('hex');
   let relay: { port: number; close(): void } | undefined;
   const remove = async (): Promise<boolean> => {
     relay?.close();
     docker(['rm', '-f', '-v', name], name);
-    let gone = docker(['inspect', '--format', '{{.State.Running}}', name], name).code !== 0; // inspect fails once the container is gone
-    if (netName) {
-      for (let i = 0; i < 10; i++) {
-        docker(['network', 'rm', netName], name);
-        const ls = docker(['network', 'ls', '--filter', `label=${LABEL_KEY}=1`, '--format', `{{.Name}}\t{{.Label "${LABEL_HOST}"}}\t{{.Label "${LABEL_PID}"}}\t{{.Label "${LABEL_TOKEN}"}}\t{{.Label "${LABEL_KEY}"}}`], name);
-        if (!ls.stdout.includes(netName)) break;
-        if (i === 9) gone = false;
-        await new Promise((r) => setTimeout(r, 300));
-      }
-    }
+    const gone = docker(['inspect', '--format', '{{.State.Running}}', name], name).code !== 0; // inspect fails once the container is gone
     return gone;
   };
-  if (netName) {
-    const mk = docker(['network', 'create', '--internal', ...labels, netName], name);
-    if (mk.code !== 0) throw new Error(`Could not create the internal Docker network: ${mk.stderr.trim().split('\n').slice(-2).join(' ')}`);
-  }
   const run = docker(
     [
-      'run', '-d', '--rm', '--name', name, ...labels, '-e', 'POSTGRES_PASSWORD',
-      ...(netName ? ['--network', netName] : ['-p', '127.0.0.1::5432', '--add-host', 'host.docker.internal:host-gateway']),
+      'run', '-d', '--rm', '--name', name, ...labels, '-e', 'POSTGRES_PASSWORD', '-e', 'POSTGRES_INITDB_ARGS',
+      ...(isolated ? ['--network', 'none'] : ['-p', '127.0.0.1::5432', '--add-host', 'host.docker.internal:host-gateway']),
       image
     ],
     name,
-    { POSTGRES_PASSWORD: password },
+    // scram-sha-256 on host (TCP) connections too, so a client that reaches the relay needs the password.
+    { POSTGRES_PASSWORD: password, POSTGRES_INITDB_ARGS: '--auth-host=scram-sha-256' },
     600_000
   );
   if (run.code !== 0) {
     await remove();
     throw new Error(`Could not start the sandbox container from image "${image}": ${run.stderr.trim().split('\n').slice(-3).join(' ')}`);
   }
-  startWatchdog(name, process.pid, netName);
+  startWatchdog(name, process.pid);
   try {
-    relay = netName ? await startRelay(name) : undefined;
+    relay = isolated ? await startRelay(name) : undefined;
     const port = relay ? relay.port : readPort(name);
     const user = await waitReady(port, password, name);
+    // Every client of the relay (and of the published port) must need the password. Prove it with a wrong one.
+    await assertAuthEnforced(
+      (pw) => `postgres://${user}:${pw}@127.0.0.1:${port}/postgres`,
+      async (url) => new Guard({ sourceUrl: url, allowTerminate: false }).connect(url)
+    );
     return {
       name,
       isolated,
@@ -184,6 +163,28 @@ function readPort(name: string): number {
   const m = /127\.0\.0\.1:(\d+)/.exec(r.stdout);
   if (r.code !== 0 || !m) throw new Error(`Could not read the port of the sandbox container (${r.stderr.trim()})`);
   return Number(m[1]);
+}
+
+/**
+ * A container whose pg_hba trusts loopback would let any local process that reaches the relay port in without the
+ * password. This connects with a WRONG password and demands a refusal. If the server lets it in, the run stops.
+ */
+export async function assertAuthEnforced(
+  urlFor: (password: string) => string,
+  connect: (url: string) => Promise<{ end(): Promise<void> }>
+): Promise<void> {
+  const wrong = `wrong-${randomBytes(8).toString('hex')}`;
+  let db: { end(): Promise<void> } | undefined;
+  try {
+    db = await connect(urlFor(wrong));
+  } catch {
+    return; // refused: this is the good case
+  }
+  await db.end().catch(() => {});
+  throw new Error(
+    'the sandbox image lets a client in with a wrong password (its pg_hba.conf trusts local connections). ' +
+      'Any process on this machine that reaches the sandbox port could then use the database. Use an image that asks for the password, such as the official postgres image.'
+  );
 }
 
 /** Waits until a TCP login works, then picks the first superuser: postgres, or supabase_admin on a Supabase image. */
@@ -389,7 +390,7 @@ export async function createSandboxIsolation(o: SandboxIsolationOptions): Promis
     });
     const notes = [
       `Sandbox: the copies live in the container ${sb.name} (image ${o.image}), reached on 127.0.0.1:${sb.port}. ` +
-        (sb.isolated ? 'The container sits on an internal Docker network: it has no route to this machine or to the internet. ' : 'The container is on the default Docker network, so it can reach this machine and the internet. ') +
+        (sb.isolated ? 'The container has no network at all (docker --network none). ' : 'The container is on the default Docker network, so it can reach this machine and the internet. ') +
         'The container is removed when the run ends.',
       ...iso.notes
     ];
@@ -450,7 +451,7 @@ async function dumpInto(sb: Sandbox, dbUrl: string, masterDb: string, urls: stri
   await pipeInto(
     sb,
     {
-      args: ['exec', '-e', 'PGPASSWORD', '-e', 'PGOPTIONS', '-e', 'PGHOST', '-e', 'PGPORT', '-e', 'PGUSER', '-e', 'PGDATABASE', sb.name, 'pg_dump', '--no-publications', '--no-subscriptions', '--no-tablespaces', '--disable-triggers'],
+      args: ['exec', '-e', 'PGPASSWORD', '-e', 'PGOPTIONS', '-e', 'PGHOST', '-e', 'PGPORT', '-e', 'PGUSER', '-e', 'PGDATABASE', sb.name, 'pg_dump', '--no-publications', '--no-subscriptions', '--no-tablespaces'],
       env: dumpEnv
     },
     { args: psqlArgs(masterDb, true) },

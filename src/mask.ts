@@ -97,8 +97,22 @@ export async function validateMasks(db: Db, masks: MaskSpec[]): Promise<string[]
     }
     const why = unsupported(m, f);
     if (why) problems.push(why);
+    const up = await parentsProblem(db, m);
+    if (up) problems.push(up);
   }
   return problems;
+}
+
+/**
+ * A table with a parent cannot be masked on its own: the parent's statistics (pg_stats with inherited = true) also hold the
+ * child's values, and the parent is not rewritten. Mask the root instead, whose rewrite reaches every table below it.
+ */
+async function parentsProblem(db: Db, m: MaskSpec): Promise<string | null> {
+  const r = await db.query(PARENTS_SQL, [m.schema, m.table]);
+  const parents = (r.rows as { parent: string }[]).map((x) => x.parent);
+  return parents.length
+    ? `${m.schema}.${m.table} inherits from ${parents.join(', ')}, whose statistics also hold its values. Mask ${m.column} on ${parents.join(' or ')} instead (that reaches this table too)`
+    : null;
 }
 
 function unsupported(m: MaskSpec, f: ColumnFacts): string | null {
@@ -145,6 +159,13 @@ export const TREE_SQL = `with recursive t as (
       join pg_class c on c.oid = i.inhrelid join pg_namespace n on n.oid = c.relnamespace)
   select schema, name, kind from t order by (oid = (select oid from t limit 1)) desc, schema, name`;
 
+/** The tables this table inherits from, or is a partition of. */
+export const PARENTS_SQL = `select pn.nspname::text || '.' || pc.relname::text as parent
+  from pg_inherits i
+  join pg_class c on c.oid = i.inhrelid join pg_namespace n on n.oid = c.relnamespace
+  join pg_class pc on pc.oid = i.inhparent join pg_namespace pn on pn.oid = pc.relnamespace
+ where n.nspname = $1 and c.relname = $2`;
+
 export interface MaskedColumn {
   column: string;
   strategy: MaskStrategy;
@@ -166,6 +187,8 @@ export async function applyMasks(db: Db, masks: MaskSpec[], salt: string = rando
     if (typeof f === 'string') throw new Error(`masking stopped: ${f}`);
     const why = unsupported(m, f);
     if (why) throw new Error(`masking stopped: ${why}`);
+    const up = await parentsProblem(db, m);
+    if (up) throw new Error(`masking stopped: ${up}`);
     const tbl = `${qi(m.schema)}.${qi(m.table)}`;
     const col = qi(m.column);
     const tree = (await db.query(TREE_SQL, [m.schema, m.table])).rows as { schema: string; name: string; kind: string }[];

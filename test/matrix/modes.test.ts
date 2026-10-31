@@ -5,7 +5,8 @@ import { join } from 'node:path';
 import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { applyMasks, parseMask } from '../../src/mask.js';
-import { hostId } from '../../src/guard.js';
+import { hostId, newToken } from '../../src/guard.js';
+import { startSandbox } from '../../src/sandbox.js';
 
 /**
  * The 0.3.0 modes against real PostgreSQL: --from-files (schema and seed only), --mask, --sandbox, and pg_cron.
@@ -124,7 +125,6 @@ function runCli(extra: string[], opts: { dir?: string; admin?: boolean } = {}): 
 const docker = (args: string[]): string => spawnSync('docker', args, { encoding: 'utf8' }).stdout.trim();
 const sandboxContainers = (): string[] => docker(['ps', '-a', '--format', '{{.Names}}', '--filter', 'name=rls-saboteur-sandbox-']).split('\n').filter(Boolean);
 const volumes = (): string => docker(['volume', 'ls', '-q']).split('\n').sort().join('\n');
-const networks = (): string[] => docker(['network', 'ls', '--format', '{{.Name}}', '--filter', 'name=rls-saboteur-sandbox-net-']).split('\n').filter(Boolean);
 
 /** How many data files of the connected database contain this text. Needs the cluster to be the matrix container. */
 async function filesHolding(c: pg.Client, needle: string): Promise<number | null> {
@@ -261,6 +261,19 @@ describe.skipIf(!superUrl)('build modes', () => {
     }
   });
 
+  it('mask-child-refused: masking a child table on its own exits 2 before anything is copied', async () => {
+    await makeSource();
+    const c = await open(urlFor(DB));
+    await c.query(`create table parent_t (id serial primary key, email text not null); create table child_t (extra text) inherits (parent_t);`);
+    await c.end();
+    const r = runCli(['--mask', 'public.child_t.email']);
+    expect(r.status, r.out).toBe(2);
+    expect(r.out).toMatch(/public\.child_t inherits from public\.parent_t/);
+    expect(r.out).toMatch(/nothing was copied/);
+    expect(r.observed).toBe('');
+    expect(await leftovers()).toEqual([]);
+  });
+
   it('mask-run: the first copy is masked before the baseline, and the same value masks the same way in two tables', async () => {
     await makeSource();
     const before = await sourceFingerprint();
@@ -353,7 +366,6 @@ describe.skipIf(!superUrl || !image)('sandbox', () => {
     expect(r.observed).not.toMatch(/CANARY|corp\.example/);
     expect(r.json?.isolation).toBe('sandbox');
     expect(sandboxContainers()).toEqual([]);
-    expect(networks()).toEqual([]);
     expect(volumes()).toBe(vols);
     expect(await sourceFingerprint()).toBe(before);
     expect(await leftovers()).toEqual([]); // nothing was created on the source's server either
@@ -435,8 +447,12 @@ ${probe(`host.docker.internal/${port}`)}
 insert into public.reach select 'host.docker.internal', r from reach_tmp; truncate reach_tmp;
 ${probe(`172.17.0.1/${port}`)}
 insert into public.reach select 'docker-bridge-gateway', r from reach_tmp; truncate reach_tmp;
+${probe(`127.0.0.1/${port}`)}
+insert into public.reach select 'own-loopback-on-the-host-port', r from reach_tmp; truncate reach_tmp;
 ${probe('1.1.1.1/443')}
-insert into public.reach select 'internet', r from reach_tmp;\n`
+insert into public.reach select 'internet', r from reach_tmp; truncate reach_tmp;
+copy reach_tmp from program 'cat /proc/net/dev | tail -n +3 | cut -d: -f1 | tr -d " "';
+insert into public.reach select 'interface', r from reach_tmp;\n`
     );
     writeFileSync(
       join(dir, 'observe.sh'),
@@ -453,16 +469,55 @@ exit 0
     );
     const r = runCli(sbArgs(['--from-files']), { dir, admin: false });
     expect(r.status, r.out).toBe(1);
-    expect(r.out).toContain('no route to your machine or to the internet');
+    expect(r.out).toContain('no network at all');
     const lines = r.observed.split('\n').filter(Boolean);
-    for (const what of ['host.docker.internal', 'docker-bridge-gateway', 'internet']) expect(lines).toContain(`reach ${what} BLOCKED`);
+    for (const what of ['host.docker.internal', 'docker-bridge-gateway', 'own-loopback-on-the-host-port', 'internet']) expect(lines).toContain(`reach ${what} BLOCKED`);
     expect(lines.some((l) => /^reach .* CONNECTED/.test(l))).toBe(false);
-    const inspect = lines.find((l) => l.startsWith('inspect '))!;
-    expect(inspect).toMatch(/^inspect rls-saboteur-sandbox-net-[0-9a-f]{12}-\d+-[0-9a-f]{16} ports=\{\} hosts=null/);
+    // The only network interface is loopback.
+    expect(lines.filter((l) => l.startsWith('reach interface '))).toEqual(['reach interface lo']);
+    expect(lines.find((l) => l.startsWith('inspect '))).toMatch(/^inspect none ports=\{\} hosts=null/);
     // Control: the same probe on the default network DOES connect to the host, so the test above can fail.
     const control = spawnSync('docker', ['run', '--rm', '--add-host', 'host.docker.internal:host-gateway', image!, 'bash', '-c', `timeout 4 bash -c "exec 3<>/dev/tcp/host.docker.internal/${port} && echo CONNECTED" 2>/dev/null || echo BLOCKED`], { encoding: 'utf8' });
     expect(control.stdout.trim()).toBe('CONNECTED');
-    expect(networks()).toEqual([]);
+  });
+
+  it('sandbox-auth-relay: a wrong password through the relay is refused, and the right one is accepted', async () => {
+    const sb = await startSandbox(image!, newToken(), true);
+    try {
+      const wrong = new pg.Client({ connectionString: sb.url('postgres').replace(sb.password, 'not-the-password') });
+      wrong.on('error', () => {});
+      await expect(wrong.connect()).rejects.toThrow(/password authentication failed/);
+      const none = new pg.Client({ host: '127.0.0.1', port: sb.port, user: sb.user, database: 'postgres' });
+      none.on('error', () => {});
+      await expect(none.connect()).rejects.toThrow();
+      const ok = new pg.Client({ connectionString: sb.url('postgres') });
+      ok.on('error', () => {});
+      await ok.connect();
+      expect((await ok.query('select 1 as n')).rows[0].n).toBe(1);
+      await ok.end();
+    } finally {
+      await sb.remove();
+    }
+    expect(sandboxContainers()).toEqual([]);
+  });
+
+  it('sandbox-auth-trust: an image that trusts loopback stops the run with exit 2 and leaves no container', async () => {
+    await makeSource();
+    const tag = 'rls-saboteur-ci-pg-trust:test';
+    const build = spawnSync('docker', ['build', '-q', '-t', tag, '-'], {
+      input: `FROM ${image}\nRUN printf '#!/bin/sh\\nsed -i "1i host all all 127.0.0.1/32 trust" "$PGDATA/pg_hba.conf"\\n' > /docker-entrypoint-initdb.d/zz-trust.sh && chmod +x /docker-entrypoint-initdb.d/zz-trust.sh\n`,
+      encoding: 'utf8'
+    });
+    expect(build.status, build.stderr).toBe(0);
+    try {
+      const r = runCli(['--sandbox', '--sandbox-image', tag, '--jobs', '1', '--from-files'], { admin: false });
+      expect(r.status, r.out).toBe(2);
+      expect(r.out).toMatch(/lets a client in with a wrong password/);
+      expect(r.observed).toBe('');
+      expect(sandboxContainers()).toEqual([]);
+    } finally {
+      docker(['image', 'rm', tag]);
+    }
   });
 
   it('sandbox-dump: the rows are streamed into the container, masked there, and the source is unchanged', async () => {
@@ -515,7 +570,7 @@ exit 0
     await sleep(3000); // let it get past the build
     child.kill('SIGKILL');
     // No handler can run after SIGKILL. The detached watchdog removes the container.
-    expect(await until(() => sandboxContainers().length === 0 && networks().length === 0, 30_000)).toBe(true);
+    expect(await until(() => sandboxContainers().length === 0, 30_000)).toBe(true);
   });
 
   for (const sig of ['SIGINT', 'SIGTERM'] as const) {
@@ -530,7 +585,6 @@ exit 0
       child.kill(sig);
       expect(await exited).toBe(sig === 'SIGINT' ? 130 : 143);
       expect(sandboxContainers()).toEqual([]);
-      expect(networks()).toEqual([]);
     });
   }
 
@@ -546,14 +600,6 @@ exit 0
     const ofDead = mk(hostId(), dead, 'a'.repeat(16));
     const ofLive = mk(hostId(), String(process.pid), 'b'.repeat(16));
     const ofOther = mk('c'.repeat(12), dead, 'd'.repeat(16));
-    const mkNet = (host: string, pid: string, token: string): string => {
-      const name = `rls-saboteur-sandbox-net-${host}-${pid}-${token}`;
-      const r = spawnSync('docker', ['network', 'create', '--internal', '--label', 'rls-saboteur.sandbox=1', '--label', `rls-saboteur.host=${host}`, '--label', `rls-saboteur.pid=${pid}`, '--label', `rls-saboteur.token=${token}`, name], { encoding: 'utf8' });
-      expect(r.status, r.stderr).toBe(0);
-      return name;
-    };
-    const netDead = mkNet(hostId(), dead, 'a'.repeat(16));
-    const netLive = mkNet(hostId(), String(process.pid), 'b'.repeat(16));
     try {
       const r = runCli(sbArgs(['--from-files']), { admin: false });
       expect(r.status, r.out).toBe(1);
@@ -561,11 +607,8 @@ exit 0
       expect(left).not.toContain(ofDead);
       expect(left).toContain(ofLive);
       expect(left).toContain(ofOther);
-      expect(networks()).not.toContain(netDead);
-      expect(networks()).toContain(netLive);
     } finally {
       for (const c of [ofDead, ofLive, ofOther]) docker(['rm', '-f', '-v', c]);
-      for (const n of [netDead, netLive]) docker(['network', 'rm', n]);
     }
   });
 });
