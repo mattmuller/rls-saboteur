@@ -274,6 +274,53 @@ describe.skipIf(!superUrl)('build modes', () => {
     expect(await leftovers()).toEqual([]);
   });
 
+  it('mask-multi-parent: a table with a parent outside the masked tree stops the run before any copy', async () => {
+    await makeSource();
+    const c = await open(urlFor(DB));
+    await c.query(`create table pa (email text); create table pb (email text); create table ch () inherits (pa, pb);`);
+    await c.end();
+    const r = runCli(['--mask', 'public.pa.email']);
+    expect(r.status, r.out).toBe(2);
+    expect(r.out).toMatch(/public\.ch also inherits from public\.pb, which is outside the tree of public\.pa/);
+    expect(r.observed).toBe('');
+    expect(await leftovers()).toEqual([]);
+  });
+
+  it('mask-copiers: a materialized view or an update rule over the masked table stops the run before any copy', async () => {
+    await makeSource();
+    const c = await open(urlFor(DB));
+    await c.query(`create materialized view people_mv as select email from people;`);
+    await c.end();
+    const r = runCli(['--mask', 'public.people.email']);
+    expect(r.status, r.out).toBe(2);
+    expect(r.out).toMatch(/materialized view (public\.)?people_mv would keep a copy/);
+    expect(r.observed).toBe('');
+    const c2 = await open(urlFor(DB));
+    await c2.query(`drop materialized view people_mv; create table people_log (old_email text); create rule log_update as on update to people do also insert into people_log values (old.email);`);
+    await c2.end();
+    const r2 = runCli(['--mask', 'public.people.email']);
+    expect(r2.status, r2.out).toBe(2);
+    expect(r2.out).toMatch(/rule log_update on (public\.)?people would keep a copy/);
+    expect(await leftovers()).toEqual([]);
+  });
+
+  it('mask-fk: a column tied to a masked column by a foreign key must be masked in the same run', async () => {
+    await makeSource();
+    const c = await open(urlFor(DB));
+    await c.query(`create table contacts (id serial primary key, person_email text references people(email)); insert into contacts(person_email) values ('real-alice@corp.example');`);
+    await c.end();
+    const alone = runCli(['--mask', 'public.people.email']);
+    expect(alone.status, alone.out).toBe(2);
+    expect(alone.out).toMatch(/public\.contacts\.person_email is tied to public\.people\.email by a foreign key/);
+    expect(alone.observed).toBe('');
+    const both = runCli(['--mask', 'public.people.email', '--mask', 'public.contacts.person_email', '--jobs', '1']);
+    expect(both.status, both.out).toBe(1);
+    const peopleLines = both.observed.split('\n').filter((l) => l.startsWith('people|'));
+    expect(peopleLines.length).toBeGreaterThan(0);
+    for (const l of peopleLines) expect(l.split('|')[2]).toMatch(/^[0-9a-f]{32}$/);
+    expect(await leftovers()).toEqual([]);
+  });
+
   it('mask-run: the first copy is masked before the baseline, and the same value masks the same way in two tables', async () => {
     await makeSource();
     const before = await sourceFingerprint();
@@ -496,6 +543,7 @@ exit 0
       const none = new pg.Client({ host: '127.0.0.1', port: sb.port, user: sb.user, database: 'postgres' });
       none.on('error', () => {});
       await expect(none.connect()).rejects.toThrow();
+      await sb.checkAuth(); // the same checks the run makes: two refused logins and no passwordless host rule
       const ok = new pg.Client({ connectionString: sb.url('postgres') });
       ok.on('error', () => {});
       await ok.connect();
@@ -507,23 +555,43 @@ exit 0
     expect(sandboxContainers()).toEqual([]);
   });
 
-  it('sandbox-auth-trust: an image that trusts loopback stops the run with exit 2 and leaves no container', async () => {
-    await makeSource();
-    const tag = 'rls-saboteur-ci-pg-trust:test';
-    const build = spawnSync('docker', ['build', '-q', '-t', tag, '-'], {
-      input: `FROM ${image}\nRUN printf '#!/bin/sh\\nsed -i "1i host all all 127.0.0.1/32 trust" "$PGDATA/pg_hba.conf"\\n' > /docker-entrypoint-initdb.d/zz-trust.sh && chmod +x /docker-entrypoint-initdb.d/zz-trust.sh\n`,
-      encoding: 'utf8'
+  for (const [label, rule, expected] of [
+    ['loopback', 'host all all 127.0.0.1/32 trust', /lets a client in|need no password/],
+    ['one database', 'host template1 all all trust', /could not check that the sandbox asks for a password|need no password|lets a client in/]
+  ] as const) {
+    it(`sandbox-auth-trust: an image with a passwordless host rule (${label}) stops the run with exit 2 and leaves no container`, async () => {
+      await makeSource();
+      const tag = `rls-saboteur-ci-pg-trust:${label.replace(' ', '-')}`;
+      const build = spawnSync('docker', ['build', '-q', '-t', tag, '-'], {
+        input: `FROM ${image}\nRUN printf '#!/bin/sh\\nsed -i "1i ${rule}" "$PGDATA/pg_hba.conf"\\n' > /docker-entrypoint-initdb.d/zz-trust.sh && chmod +x /docker-entrypoint-initdb.d/zz-trust.sh\n`,
+        encoding: 'utf8'
+      });
+      expect(build.status, build.stderr).toBe(0);
+      try {
+        const r = runCli(['--sandbox', '--sandbox-image', tag, '--jobs', '1', '--from-files'], { admin: false });
+        expect(r.status, r.out).toBe(2);
+        expect(r.out).toMatch(expected);
+        expect(r.observed).toBe('');
+        expect(sandboxContainers()).toEqual([]);
+      } finally {
+        docker(['image', 'rm', tag]);
+      }
     });
-    expect(build.status, build.stderr).toBe(0);
-    try {
-      const r = runCli(['--sandbox', '--sandbox-image', tag, '--jobs', '1', '--from-files'], { admin: false });
-      expect(r.status, r.out).toBe(2);
-      expect(r.out).toMatch(/lets a client in with a wrong password/);
-      expect(r.observed).toBe('');
-      expect(sandboxContainers()).toEqual([]);
-    } finally {
-      docker(['image', 'rm', tag]);
-    }
+  }
+
+  it('sandbox-auth-after-build: a migration that loosens pg_hba.conf stops the run before any copy', async () => {
+    await makeSource();
+    const dir = join(scratch, 'hbaproj');
+    cpSync(project, dir, { recursive: true });
+    writeFileSync(
+      join(dir, 'supabase', 'migrations', '20260101000001_hba.sql'),
+      `copy (select 'host all all all trust') to program 'cat >> "$PGDATA/pg_hba.conf"';\nselect pg_reload_conf();\n`
+    );
+    const r = runCli(sbArgs(['--from-files']), { dir, admin: false });
+    expect(r.status, r.out).toBe(2);
+    expect(r.out).toMatch(/pg_hba\.conf has 1 host rule\(s\) that need no password/);
+    expect(r.observed).toBe(''); // no test ran, so no copy was made
+    expect(sandboxContainers()).toEqual([]);
   });
 
   it('sandbox-dump: the rows are streamed into the container, masked there, and the source is unchanged', async () => {
@@ -593,6 +661,19 @@ exit 0
       expect(sandboxContainers()).toEqual([]);
     });
   }
+
+  it('sandbox-sigint-startup: SIGINT while the container is still starting removes it and exits 130', async () => {
+    await makeSource();
+    const args = cliArgs([...sbArgs(['--from-files'])], join(scratch, 'sigstart.txt'), project);
+    args[args.indexOf('--test') + 1] = 'sleep 300';
+    const child = spawn('node', args, { cwd: project, stdio: 'ignore' });
+    const exited = new Promise<number | null>((res) => child.on('exit', (c) => res(c)));
+    // The moment the container exists, before the database in it is ready.
+    expect(await until(() => sandboxContainers().length === 1, 120_000)).toBe(true);
+    child.kill('SIGINT');
+    expect(await exited).toBe(130);
+    expect(sandboxContainers()).toEqual([]);
+  });
 
   it('sandbox-sweep: the next run removes the container of a dead process, and no other', async () => {
     await makeSource();

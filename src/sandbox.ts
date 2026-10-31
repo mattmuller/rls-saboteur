@@ -42,6 +42,8 @@ export interface Sandbox {
   password: string;
   /** URL of a database in the container. Loopback only. */
   url(db: string): string;
+  /** Proves again that the server asks for a password. Run after anything of yours has run in the container. */
+  checkAuth(): Promise<void>;
   /** Removes the container. Returns true when it is gone. */
   remove(): Promise<boolean>;
 }
@@ -69,10 +71,18 @@ export function sweepContainers(token: string, own: string): string[] {
   return removed;
 }
 
+const MAX_RELAYED = 64;
+
 /** Carries TCP connections from this machine to the server inside an isolated container, one `docker exec` each. */
 function startRelay(name: string): Promise<{ port: number; close(): void }> {
   const children = new Set<ReturnType<typeof dockerSpawn>>();
   const server = net.createServer((sock) => {
+    // Another process on this machine can connect to this port. A password stops it, and this cap stops it from filling
+    // the process table with `docker exec` children.
+    if (children.size >= MAX_RELAYED) {
+      sock.destroy();
+      return;
+    }
     const ch = dockerSpawn(['exec', '-i', name, 'bash', '-c', RELAY_SCRIPT], name);
     children.add(ch);
     const end = (): void => {
@@ -139,11 +149,23 @@ export async function startSandbox(image: string, token: string, isolated = fals
     const port = relay ? relay.port : readPort(name);
     const user = await waitReady(port, password, name);
     // Every client of the relay (and of the published port) must need the password. Prove it with a wrong one.
-    await assertAuthEnforced(
-      (pw) => `postgres://${user}:${pw}@127.0.0.1:${port}/postgres`,
-      async (url) => new Guard({ sourceUrl: url, allowTerminate: false }).connect(url)
-    );
+    const checkAuth = async (): Promise<void> => {
+      await assertAuthEnforced(
+        (u, pw, db) => `postgres://${encodeURIComponent(u)}:${pw}@127.0.0.1:${port}/${db}`,
+        user,
+        async (url) => new Guard({ sourceUrl: url, allowTerminate: false }).connect(url)
+      );
+      const okUrl = `postgres://${user}:${password}@127.0.0.1:${port}/postgres`;
+      const c = await new Guard({ sourceUrl: okUrl, allowTerminate: false }).connect(okUrl);
+      try {
+        await assertNoPasswordlessHostRules((sql) => c.query(sql));
+      } finally {
+        await c.end().catch(() => {});
+      }
+    };
+    await checkAuth();
     return {
+      checkAuth,
       name,
       isolated,
       port,
@@ -166,25 +188,57 @@ function readPort(name: string): number {
 }
 
 /**
- * A container whose pg_hba trusts loopback would let any local process that reaches the relay port in without the
- * password. This connects with a WRONG password and demands a refusal. If the server lets it in, the run stops.
+ * SQLSTATE 28P01 is "password authentication failed". 28000 ("invalid authorization specification") is NOT accepted: on a
+ * rule that trusts everyone, a user that does not exist also gets 28000 ("role does not exist"), so it proves nothing.
+ */
+const AUTH_REFUSED = new Set(['28P01']);
+
+/**
+ * Proves the server asks for a password. It tries two logins that must be refused AS AN AUTHENTICATION FAILURE:
+ * the right user with a wrong password, and a random user that does not exist on a database other than "postgres"
+ * (a rule that trusts one user or one database would let the second in). Any other error (a refused connection, a server
+ * that is still starting, a missing database) is not a refusal, and stops the run: a check that cannot run proves nothing.
  */
 export async function assertAuthEnforced(
-  urlFor: (password: string) => string,
+  urlFor: (user: string, password: string, db: string) => string,
+  user: string,
   connect: (url: string) => Promise<{ end(): Promise<void> }>
 ): Promise<void> {
-  const wrong = `wrong-${randomBytes(8).toString('hex')}`;
-  let db: { end(): Promise<void> } | undefined;
-  try {
-    db = await connect(urlFor(wrong));
-  } catch {
-    return; // refused: this is the good case
+  const probes = [
+    { user, db: 'postgres', what: 'the right user with a wrong password' },
+    { user: `nobody_${randomBytes(6).toString('hex')}`, db: 'template1', what: 'a user that does not exist, on another database' }
+  ];
+  for (const p of probes) {
+    const wrong = `wrong-${randomBytes(8).toString('hex')}`;
+    let db: { end(): Promise<void> } | undefined;
+    try {
+      db = await connect(urlFor(p.user, wrong, p.db));
+    } catch (e) {
+      const code = (e as { code?: string }).code;
+      if (code && AUTH_REFUSED.has(code)) continue; // refused by authentication: the good case
+      throw new Error(`could not check that the sandbox asks for a password (${p.what}): ${(e as Error).message}`);
+    }
+    await db.end().catch(() => {});
+    throw new Error(
+      `the sandbox lets a client in without the right password (${p.what}). Its pg_hba.conf trusts that connection. ` +
+        'Any process on this machine that reaches the sandbox port could then use the database. Use an image that asks for the password, such as the official postgres image.'
+    );
   }
-  await db.end().catch(() => {});
-  throw new Error(
-    'the sandbox image lets a client in with a wrong password (its pg_hba.conf trusts local connections). ' +
-      'Any process on this machine that reaches the sandbox port could then use the database. Use an image that asks for the password, such as the official postgres image.'
-  );
+}
+
+/** Host rules whose method needs no password. "reject" is fine. Local (socket) rules are not listed: only the container can use them. */
+export const PASSWORDLESS_RULES_SQL = `select line_number, type, database::text as database, user_name::text as user_name, address, auth_method
+  from pg_hba_file_rules where type like 'host%' and auth_method not in ('scram-sha-256', 'md5', 'password', 'reject') order by line_number`;
+
+export async function assertNoPasswordlessHostRules(query: (sql: string) => Promise<{ rows: Record<string, unknown>[] }>): Promise<void> {
+  const r = await query(PASSWORDLESS_RULES_SQL);
+  if (r.rows.length) {
+    const first = r.rows[0];
+    throw new Error(
+      `the sandbox's pg_hba.conf has ${r.rows.length} host rule(s) that need no password (line ${String(first.line_number)}: ${String(first.type)} ${String(first.database)} ${String(first.user_name)} ${String(first.address ?? '')} ${String(first.auth_method)}). ` +
+        'A process on this machine that reaches the sandbox port could use the database. Use an image that asks for the password, such as the official postgres image.'
+    );
+  }
 }
 
 /** Waits until a TCP login works, then picks the first superuser: postgres, or supabase_admin on a Supabase image. */
@@ -335,16 +389,23 @@ export interface SandboxIsolationOptions {
 
 export async function createSandboxIsolation(o: SandboxIsolationOptions): Promise<Isolation> {
   const token = newToken();
-  const sb = await startSandbox(o.image, token, o.files !== null);
+  const name = containerNameFor(hostId(), process.pid, token);
+  let sb: Sandbox | undefined;
   let signalled = false;
+  // Installed BEFORE the container starts, so a Ctrl-C during the image pull or the start-up still removes it.
+  const removeNow = async (): Promise<boolean> => {
+    if (sb) return sb.remove();
+    docker(['rm', '-f', '-v', name], name);
+    return docker(['inspect', '--format', '{{.State.Running}}', name], name).code !== 0;
+  };
   const onSignal = (sig: NodeJS.Signals): void => {
     if (signalled) return;
     signalled = true;
     const code = sig === 'SIGINT' ? 130 : 143;
-    sb.remove()
+    removeNow()
       .then((gone) => {
         if (!gone) {
-          process.stderr.write(`rls-saboteur could not remove its sandbox container. Remove it yourself: docker rm -f -v ${sb.name}\n`);
+          process.stderr.write(`rls-saboteur could not remove its sandbox container. Remove it yourself: docker rm -f -v ${name}\n`);
           process.exit(1);
         }
         process.exit(code);
@@ -357,13 +418,21 @@ export async function createSandboxIsolation(o: SandboxIsolationOptions): Promis
     process.off('SIGINT', onSignal);
     process.off('SIGTERM', onSignal);
   };
-  const afterCleanup = async (): Promise<void> => {
-    const gone = await sb.remove();
+  try {
+    sb = await startSandbox(o.image, token, o.files !== null);
+  } catch (e) {
+    if (signalled) await new Promise<never>(() => {});
     uninstall();
-    if (!gone) throw new Error(`rls-saboteur could not remove its sandbox container. Remove it yourself: docker rm -f -v ${sb.name}`);
+    throw e;
+  }
+  const box = sb;
+  const afterCleanup = async (): Promise<void> => {
+    const gone = await box.remove();
+    uninstall();
+    if (!gone) throw new Error(`rls-saboteur could not remove its sandbox container. Remove it yourself: docker rm -f -v ${box.name}`);
   };
   try {
-    const sourceUrl = sb.url('postgres');
+    const sourceUrl = box.url('postgres');
     const sourceGuardUrls = [o.dbUrl, sourceUrl];
     const iso = await createIsolation({
       sourceUrl,
@@ -383,14 +452,16 @@ export async function createSandboxIsolation(o: SandboxIsolationOptions): Promis
           } finally {
             await m.end().catch(() => {});
           }
-          return;
+        } else {
+          await dumpInto(sb, o.dbUrl, databaseOf(masterUrl), sourceGuardUrls);
         }
-        await dumpInto(sb, o.dbUrl, databaseOf(masterUrl), sourceGuardUrls);
+        // Your files (or the restored dump) have run as superuser. They could have loosened pg_hba.conf and reloaded it.
+        await box.checkAuth();
       }
     });
     const notes = [
-      `Sandbox: the copies live in the container ${sb.name} (image ${o.image}), reached on 127.0.0.1:${sb.port}. ` +
-        (sb.isolated ? 'The container has no network at all (docker --network none). ' : 'The container is on the default Docker network, so it can reach this machine and the internet. ') +
+      `Sandbox: the copies live in the container ${box.name} (image ${o.image}), reached on 127.0.0.1:${box.port}. ` +
+        (box.isolated ? 'The container has no network at all (docker --network none). ' : 'The container is on the default Docker network, so it can reach this machine and the internet. ') +
         'The container is removed when the run ends.',
       ...iso.notes
     ];

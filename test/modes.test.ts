@@ -17,7 +17,7 @@ import {
 import { applyMasks, maskText, parseMask, scrambleExpr, validateMasks } from '../src/mask.js';
 import { discoverBuildFiles, pgCronHint } from '../src/files.js';
 import { modeLines, policyDifferences, sandboxImageFor } from '../src/run.js';
-import { assertAuthEnforced, containerHostFor, dumpEnvFor, rolesScript } from '../src/sandbox.js';
+import { PASSWORDLESS_RULES_SQL, assertAuthEnforced, assertNoPasswordlessHostRules, containerHostFor, dumpEnvFor, rolesScript } from '../src/sandbox.js';
 import type { Db } from '../src/guard.js';
 import type { Policy } from '../src/types.js';
 
@@ -164,7 +164,7 @@ describe('mask: parsing', () => {
 });
 
 /** A fake database that answers the mask queries. `s` controls what it says. */
-function fakeDb(s: { exists?: boolean; type?: string; before?: number; updated?: number; left?: number; noSuper?: boolean; statsLeft?: number; parents?: string[]; tree?: { schema: string; name: string; kind: string }[]; relkind?: string; generated?: string }): { db: Db; log: string[] } {
+function fakeDb(s: { exists?: boolean; type?: string; before?: number; updated?: number; left?: number; noSuper?: boolean; statsLeft?: number; parents?: string[]; outside?: { member: string; outside_parent: string }[]; copiers?: string[]; fkRefs?: string[]; tree?: { schema: string; name: string; kind: string }[]; relkind?: string; generated?: string }): { db: Db; log: string[] } {
   const log: string[] = [];
   const db: Db = {
     async end() {},
@@ -174,6 +174,9 @@ function fakeDb(s: { exists?: boolean; type?: string; before?: number; updated?:
         if (s.exists === false) return { rows: [], rowCount: 0 } as never;
         return { rows: [{ relkind: s.relkind ?? 'r', type: s.type ?? 'text', base: s.type ?? 'text', generated: s.generated ?? '', identity: '', maxlen: null }], rowCount: 1 } as never;
       }
+      if (/as outside_parent/.test(text)) return { rows: s.outside ?? [], rowCount: 0 } as never;
+      if (/as ref\s+from pg_constraint/.test(text)) return { rows: (s.fkRefs ?? []).map((ref) => ({ ref })), rowCount: 0 } as never;
+      if (/as what/.test(text)) return { rows: (s.copiers ?? []).map((what) => ({ what })), rowCount: 0 } as never;
       if (/as parent\s+from pg_inherits/.test(text)) return { rows: (s.parents ?? []).map((parent) => ({ parent })), rowCount: 0 } as never;
       if (/with recursive t as/.test(text)) return { rows: s.tree ?? [{ schema: 'public', name: 'users', kind: 'r' }], rowCount: 1 } as never;
       if (/from pg_stats s/.test(text)) return { rows: [{ n: s.statsLeft ?? 0 }], rowCount: 1 } as never;
@@ -239,6 +242,24 @@ describe('mask: it fails closed', () => {
     await expect(applyMasks(db, [parseMask('public.child.email')], 's')).rejects.toThrow(/inherits from public\.parent.*Mask email on public\.parent/);
     expect(log.some((l) => /^update/.test(l))).toBe(false);
     expect((await validateMasks(fakeDb({ parents: ['public.parent'] }).db, [parseMask('public.child.email')]))[0]).toMatch(/inherits from public\.parent/);
+  });
+  it('mask-inherit: a member with a parent outside the tree stops the run', async () => {
+    const { db, log } = fakeDb({ outside: [{ member: 'public.ch', outside_parent: 'public.pb' }] });
+    await expect(applyMasks(db, [parseMask('public.pa.email')], 's')).rejects.toThrow(/public\.ch also inherits from public\.pb, which is outside the tree of public\.pa/);
+    expect(log.some((l) => /^update/.test(l))).toBe(false);
+    expect((await validateMasks(fakeDb({ outside: [{ member: 'public.ch', outside_parent: 'public.pb' }] }).db, [parseMask('public.pa.email')]))[0]).toMatch(/outside the tree/);
+  });
+  it('mask-fk: a column tied to the masked one by a foreign key must be masked in the same run', async () => {
+    const { db, log } = fakeDb({ fkRefs: ['public.orders.buyer_email'] });
+    await expect(applyMasks(db, [parseMask('public.users.email')], 's')).rejects.toThrow(/public\.orders\.buyer_email is tied to public\.users\.email by a foreign key/);
+    expect(log.some((l) => /^update/.test(l))).toBe(false);
+    // Named in the same run: allowed.
+    await expect(applyMasks(fakeDb({ fkRefs: ['public.orders.buyer_email'] }).db, [parseMask('public.users.email'), parseMask('public.orders.buyer_email')], 's')).resolves.toHaveLength(2);
+  });
+  it('mask-copiers: an update rule or a materialized view over the table stops the run', async () => {
+    const { db, log } = fakeDb({ copiers: ['materialized view public.people_mv'] });
+    await expect(applyMasks(db, [parseMask('public.people.email')], 's')).rejects.toThrow(/materialized view public\.people_mv would keep a copy/);
+    expect(log.some((l) => /^update/.test(l))).toBe(false);
   });
   it('mask-inherit: a foreign table below the masked one stops the run before anything is rewritten', async () => {
     const { db, log } = fakeDb({ tree: [{ schema: 'public', name: 'parent', kind: 'r' }, { schema: 'public', name: 'remote', kind: 'f' }] });
@@ -326,12 +347,41 @@ describe('plan lines and helpers', () => {
     expect(modeLines({ sandbox: true, buildFiles: files }).join(' ')).toMatch(/no network at all/);
     expect(modeLines({ sandbox: true }).join(' ')).toMatch(/can reach your machine and the internet/);
   });
-  it('sandbox-auth: a server that lets a wrong password in stops the run, one that refuses it passes', async () => {
-    await expect(assertAuthEnforced((pw) => `postgres://u:${pw}@h/db`, async () => ({ end: async () => {} }))).rejects.toThrow(/wrong password/);
-    await expect(assertAuthEnforced((pw) => `postgres://u:${pw}@h/db`, async () => { throw new Error('password authentication failed'); })).resolves.toBeUndefined();
-    const seen: string[] = [];
-    await assertAuthEnforced((pw) => { seen.push(pw); return `postgres://u:${pw}@h/db`; }, async () => { throw new Error('no'); });
-    expect(seen[0]).toMatch(/^wrong-[0-9a-f]{16}$/);
+  it('sandbox-auth: only a password refusal counts as a refusal, and both probes must be refused', async () => {
+    const refuse = Object.assign(new Error('password authentication failed'), { code: '28P01' });
+    const url = (u: string, pw: string, db: string): string => `postgres://${u}:${pw}@h/${db}`;
+    // Both refused: pass.
+    await expect(assertAuthEnforced(url, 'u', async () => { throw refuse; })).resolves.toBeUndefined();
+    // A connection that works is a failure, on the first probe or on the second.
+    await expect(assertAuthEnforced(url, 'u', async () => ({ end: async () => {} }))).rejects.toThrow(/lets a client in/);
+    let n = 0;
+    await expect(assertAuthEnforced(url, 'u', async () => { if (n++ === 0) throw refuse; return { end: async () => {} }; })).rejects.toThrow(/lets a client in.*does not exist, on another database/);
+    // Any other error is not a refusal: a refused connection, a starting server, a missing database, "role does not exist".
+    for (const code of [undefined, 'ECONNREFUSED', '57P03', '3D000', '28000', '42501']) {
+      const other = Object.assign(new Error('some other failure'), { code });
+      await expect(assertAuthEnforced(url, 'u', async () => { throw other; }), String(code)).rejects.toThrow(/could not check that the sandbox asks for a password/);
+    }
+    // The probes: the right user on postgres, and a random user that is not the real one on template1, each with a random wrong password.
+    const seen: { u: string; pw: string; db: string }[] = [];
+    await assertAuthEnforced((u, pw, db) => { seen.push({ u, pw, db }); return url(u, pw, db); }, 'sup', async () => { throw refuse; });
+    expect(seen.map((x) => x.db)).toEqual(['postgres', 'template1']);
+    expect(seen[0].u).toBe('sup');
+    expect(seen[1].u).toMatch(/^nobody_[0-9a-f]{12}$/);
+    expect(seen.every((x) => /^wrong-[0-9a-f]{16}$/.test(x.pw))).toBe(true);
+  });
+  it('sandbox-auth-rules: a host rule that needs no password stops the run', async () => {
+    await expect(assertNoPasswordlessHostRules(async () => ({ rows: [] }))).resolves.toBeUndefined();
+    await expect(
+      assertNoPasswordlessHostRules(async () => ({ rows: [{ line_number: 3, type: 'host', database: '{template1}', user_name: '{all}', address: 'all', auth_method: 'trust' }] }))
+    ).rejects.toThrow(/1 host rule\(s\) that need no password \(line 3: host \{template1\}/);
+    // The query asks for host rules whose method is not a password method (and "reject" is fine).
+    expect(PASSWORDLESS_RULES_SQL).toMatch(/type like 'host%'/);
+    expect(PASSWORDLESS_RULES_SQL).toMatch(/not in \('scram-sha-256', 'md5', 'password', 'reject'\)/);
+  });
+  it('plan: files mode claims an isolated network, dump mode admits the container can reach out', () => {
+    const files = { migrations: ['a.sql'], seed: null, description: '1 migration file(s)' };
+    expect(modeLines({ sandbox: true, buildFiles: files }).join(' ')).toMatch(/no network at all/);
+    expect(modeLines({ sandbox: true }).join(' ')).toMatch(/can reach your machine and the internet/);
   });
   it('plan: the new modes say what they do', () => {
     const files = { migrations: ['a.sql'], seed: null, description: '1 migration file(s)' };
