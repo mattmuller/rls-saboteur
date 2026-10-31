@@ -67,6 +67,8 @@ describe('docker guard', () => {
     }
     expect(() => checkDockerArgs(runArgs(['--privileged']), name)).toThrow(DockerGuardError);
     expect(() => checkDockerArgs(runArgs([], '--privileged'), name)).toThrow(DockerGuardError);
+    expect(() => checkDockerArgs(runArgs().map((x) => (x === '127.0.0.1::5432' ? '0.0.0.0::5432' : x)), name)).toThrow(DockerGuardError);
+    expect(() => checkDockerArgs(runArgs().map((x) => (x === 'host.docker.internal:host-gateway' ? 'x:y' : x)), name)).toThrow(DockerGuardError);
     const other = containerNameFor(hostId(), process.pid + 1, token);
     expect(() => checkDockerArgs(runArgs().map((x) => (x === name ? other : x)), name)).toThrow(DockerGuardError);
   });
