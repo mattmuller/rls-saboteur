@@ -530,8 +530,8 @@ async function dumpInto(sb: Sandbox, dbUrl: string, masterDb: string, urls: stri
   ).catch((e: Error) => {
     throw new Error(
       `sandbox: loading the dump into the container failed:\n${e.message}${pgCronHint(e.message)}\n` +
-        `A source that uses extensions or schemas the image lacks needs a different --sandbox-image, ` +
-        `and a Supabase source needs --from-files (the Supabase image already holds the managed schemas).`
+        `A source that uses extensions or schemas the image lacks needs a different --sandbox-image that asks for a password. ` +
+        `The Supabase Postgres image is refused, because it trusts loopback.`
     );
   });
 }

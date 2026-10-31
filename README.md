@@ -231,13 +231,13 @@ The copies live in a throwaway PostgreSQL container, not on the server that hold
 
 ```sh
 npx rls-saboteur --sandbox
-npx rls-saboteur --sandbox --sandbox-image public.ecr.aws/supabase/postgres:17.6.1.011
+npx rls-saboteur --sandbox --sandbox-image my-registry/postgres-with-pgtap:17
 ```
 
 - **What it changes.** Nothing is created on your server, nothing there is locked, and no session on it is ever closed. A busy local Supabase needs no `--close-sessions` and no `--admin-url`. A source over 2 GB still needs `--max-size` when rows are streamed in.
 - **What it does not change.** The copies still hold files. The container's storage is deleted with the container. On Linux that storage is on the same machine as Docker, so "no copy on your machine" is true of your database server, not of the disk. On Docker Desktop it is inside the Docker VM.
 - **How the rows get in.** Without `--from-files`, the tool runs `pg_dump` inside the container, against your database, in a session that the server holds read-only (`PGOPTIONS=-c default_transaction_read_only=on`), and loads the result with `psql`. Roles are created first from `pg_roles` (no superuser, no password). `pg_dump` creates triggers after it loads the data, so no trigger fires during the load. The rows pass through the Docker client as a stream and are not stored outside the container.
-- **The image.** The default is `postgres:<major version of your database>` from Docker Hub, pulled if it is not here. That image has no pgTAP and none of the Supabase roles or extensions. Pass `--sandbox-image` for an image that does. A Supabase source loaded by dump into a Supabase image fails, because the image already holds the managed schemas. For Supabase, use `--from-files`.
+- **The image.** The default is `postgres:<major version of your database>` from Docker Hub, pulled if it is not here. That image has no pgTAP and none of the Supabase roles, schemas or extensions. Pass `--sandbox-image` for an image that has what your tests need, and that asks for a password. **The Supabase Postgres image is refused in this release.** Its `pg_hba.conf` trusts connections from loopback, which is how this tool reaches the container, so the password check stops the run with exit 2 (tested with `public.ecr.aws/supabase/postgres:17.6.1.011`; the output is in the release evidence). So a Supabase project cannot use `--sandbox` as it is: a dump of a Supabase database needs that image's schemas and extensions, and `--from-files` needs an image that has the roles and schemas the migrations use. Use the official image and make the migrations create what they use, or use the default mode.
 - **`--sandbox-image` runs an image you name.** Treat it like any command you run.
 - **Reaching your database from the container.** The container reaches a source on `127.0.0.1` through `host.docker.internal`. That works on Docker Desktop. On Docker Engine for Linux, a source that listens on `127.0.0.1` only may not be reachable from a container; the Docker documentation does not promise it, and this release did not test it. A source published on `0.0.0.0` works.
 - **Safety.** There are two container shapes. With a dump, the container sits on the default Docker network and publishes one port on `127.0.0.1` only. With `--from-files`, it has no network at all (`--network none`) and no published port (see below). Either way: a random password, no mount, no privilege, no host network. Every `docker` call goes through one allowlist (`src/docker.ts`), like the database guard. It starts those two shapes, runs only `pg_dump`, `psql`, `pg_isready` and one fixed relay script inside the container, and removes only containers that carry the tool's name and labels and belong to this run, or to a dead process of this host.
@@ -259,7 +259,7 @@ npx rls-saboteur --sandbox --from-files
 - **Tested runners.** The `psql` runner and `--test` commands, on Docker Desktop for Mac. The Supabase CLI runner (`supabase test db`) connects to the relay on `127.0.0.1`; this release did not test it. Linux Engine was not tested.
 - **The policies must match.** Breaks are generated from the policies of your database. After the build, the tool compares the policies of the copy with the policies of your database. If any differ, the run exits 2 and names them, before any test runs.
 - **Your database is still read for its catalogue**, as before: policies, tables, columns and roles. No user table is selected from.
-- **Roles.** The files must create the roles they use, or the image must have them (a Supabase image does). A role the files do not create stops the build with the server's message.
+- **Roles.** The files must create the roles they use, or the image must have them. A role the files do not create stops the build with the server's message.
 
 ### Masking: `--mask`
 
@@ -293,7 +293,7 @@ Scheduled `pg_cron` jobs do not run in a copy. This was tested on a real server,
 - A job fires in a copy only if a job in the cron database names that copy in its `database` column. Copy names are random for every run, so no existing job can name one. (Shown by scheduling such a job on purpose: it did fire. That needs a job written against the copy's name, which the tool never publishes.)
 - Jobs registered in your database keep running there, as they did before. The tool is read-only on it and does not pause them.
 - The scheduler keeps a connection to the cron database open. That is why the first copy of a stock local Supabase needs `--close-sessions` (see "The first copy and open connections").
-- **A build mode cannot create `pg_cron`.** `create extension pg_cron` is accepted only in the cron database, so it fails in the fresh database of a copy built from files or a dump. The run exits 2 and says so. Use the default mode (a clone keeps the extension and its inert jobs) or keep `pg_cron` out of the files.
+- **A build mode cannot create `pg_cron`.** `create extension pg_cron` is accepted only in the cron database, so it fails in the fresh database of a copy built from files or a dump. The run exits 2 and says so (observed on the Supabase image, before this release began to refuse that image). Use the default mode (a clone keeps the extension and its inert jobs) or keep `pg_cron` out of the files.
 
 ## Ideas
 
