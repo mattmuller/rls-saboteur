@@ -9,7 +9,9 @@ export interface RunModel {
   policyCount: number;
   tableCount: number;
   baselineAssertions?: number;
-  isolation: 'template';
+  isolation: 'template' | 'files' | 'sandbox';
+  /** Columns masked in the first copy. */
+  masked?: { column: string; strategy: string; rows: number }[];
   notes: string[];
   results: BreakResult[];
   findings: Finding[];
@@ -248,6 +250,7 @@ export function jsonReport(m: RunModel): string {
       policies: m.policyCount,
       tables: m.tableCount,
       isolation: m.isolation,
+      masked: m.masked ?? [],
       threshold: m.threshold,
       score: s,
       exit: exitCode(m),

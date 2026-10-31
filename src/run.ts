@@ -2,7 +2,10 @@ import { generateBreaks } from './breaks.js';
 import { readCatalogue } from './catalogue.js';
 import { runChecks } from './checks.js';
 import { CONFIG_FILE, type SkipRule, redact, scrubSecrets } from './config.js';
-import { createIsolation } from './isolation.js';
+import { createIsolation, type Isolation } from './isolation.js';
+import { createSandboxIsolation } from './sandbox.js';
+import { type BuildFiles, loadFiles } from './files.js';
+import { type MaskSpec, maskText, validateMasks } from './mask.js';
 import { Guard } from './guard.js';
 import { type Prompter, visible } from './confirm.js';
 import { hostOf, urlIsLocal } from './safety.js';
@@ -10,7 +13,7 @@ import { describeFacts, readFacts, type ServerFacts } from './facts.js';
 import { DEFAULT_MAX_SIZE, formatSize } from './options.js';
 import { describeCatalogue, type RunModel } from './report.js';
 import { filesMentioning, type TestRun, type TestSuite } from './tests.js';
-import type { Break, BreakResult, Finding } from './types.js';
+import type { Break, BreakResult, Finding, Policy } from './types.js';
 
 export interface RunOptions {
   dbUrl: string;
@@ -44,6 +47,31 @@ export interface RunOptions {
   filter?: string;
   skip: SkipRule[];
   progress: (line: string) => void;
+  /** Working directory, where the migration and seed files are read from. */
+  cwd?: string;
+  /** --from-files: build the copies from these files; no row of the database is copied. */
+  buildFiles?: BuildFiles | null;
+  /** --sandbox: the copies live in a Docker container. */
+  sandbox?: boolean;
+  /** --sandbox-image. Default: postgres:<major version of the source>. */
+  sandboxImage?: string;
+  /** --mask: columns scrambled in the first copy before any break runs. */
+  masks?: MaskSpec[];
+}
+
+/** Policies that differ between two catalogues, by schema.table/name. Used to prove files rebuild the database's policies. */
+export function policyDifferences(fromDatabase: Policy[], fromCopy: Policy[]): string[] {
+  const key = (p: Policy): string => `${p.schema}.${p.table}/${p.name}`;
+  const body = (p: Policy): string => JSON.stringify([p.cmd, p.permissive, [...p.roles].sort(), p.qual, p.withCheck]);
+  const a = new Map(fromDatabase.map((p) => [key(p), body(p)]));
+  const b = new Map(fromCopy.map((p) => [key(p), body(p)]));
+  const out: string[] = [];
+  for (const [k, v] of a) {
+    if (!b.has(k)) out.push(`${k} is in the database but not in the copy`);
+    else if (b.get(k) !== v) out.push(`${k} differs between the database and the copy`);
+  }
+  for (const k of b.keys()) if (!a.has(k)) out.push(`${k} is in the copy but not in the database`);
+  return out;
 }
 
 export interface RunOutput {
@@ -61,6 +89,7 @@ export async function run(o: RunOptions): Promise<RunOutput> {
     policyCount: 0,
     tableCount: 0,
     isolation: 'template',
+    masked: [],
     notes: [],
     results: [],
     findings: [],
@@ -79,10 +108,14 @@ export async function run(o: RunOptions): Promise<RunOutput> {
   let breaks: Break[];
   let facts: ServerFacts | undefined;
   let factsError: string | undefined;
+  let maskProblems: string[] = [];
   try {
     const cat = await readCatalogue(client, o.schemas);
     Object.assign(model, describeCatalogue(cat));
     model.policies = cat.policies;
+    if (o.masks?.length && !o.checksOnly) {
+      maskProblems = await validateMasks(client, o.masks);
+    }
     findings = await runChecks(client, o.schemas);
     const gen = generateBreaks(cat);
     breaks = gen.breaks;
@@ -97,6 +130,14 @@ export async function run(o: RunOptions): Promise<RunOutput> {
     await client.end().catch(() => {});
   }
   model.findings = findings;
+
+  if (maskProblems.length) {
+    model.couldNotCheck =
+      `--mask cannot be applied, so nothing was copied: ${maskProblems.join('; ')}. ` +
+      `A run never goes on with rows it was told to scramble.`;
+    model.durationMs = Date.now() - started;
+    return { model, breaks };
+  }
 
   if (o.filter) breaks = breaks.filter((b) => b.id.includes(o.filter!));
 
@@ -140,7 +181,7 @@ export async function run(o: RunOptions): Promise<RunOutput> {
     model.durationMs = Date.now() - started;
     return { model, breaks };
   }
-  if (facts.sizeBytes > limit) {
+  if (facts.sizeBytes > limit && !o.buildFiles) {
     const jobsN = Math.max(1, o.jobs);
     model.couldNotCheck =
       `the database is ${facts.sizePretty}, larger than the limit of ${formatSize(limit)}. ` +
@@ -164,6 +205,7 @@ export async function run(o: RunOptions): Promise<RunOutput> {
     `Plan\n` +
     `  Database: ${visible(dbName)} on ${visible(scrubSecrets(hostOf(o.dbUrl), [o.dbUrl]))} (${local ? 'local' : 'NOT local'}; that is the host name only, the lines below come from the server)\n` +
     describeFacts(facts, dbName).map((l) => `  ${l}\n`).join('') +
+    modeLines(o).map((l) => `  ${l}\n`).join('') +
     `  Note: outbound HTTP from the copy ${o.isolateNetwork === false ? 'is NOT switched off (--no-isolate-network was given)' : 'is switched off'}.\n` +
     `  Test environment: ${
       o.removedEnv?.length
@@ -176,30 +218,78 @@ export async function run(o: RunOptions): Promise<RunOutput> {
     (suite.mode === 'custom'
       ? ''
       : `  Note: the test files are your code. They run with the rights of your database user on this server, so a \\c or dblink inside one can reach other databases there.\n`) +
-    `  It will: make temporary copies of it, break ${todo.length} policies in the copies, run: ${visible(suite.description)}\n` +
+    `  It will: ${o.buildFiles ? 'build temporary copies from files' : 'make temporary copies of it'}, break ${todo.length} policies in the copies, run: ${visible(suite.description)}\n` +
     `  It will not change this database.\n` +
     `Continue? (y/N)`;
   if (!(await o.confirm.ask(planText, `the plan: temporary copies of "${visible(dbName)}", ${todo.length} breaks in the copies, tests run: ${visible(suite.description)}`))) {
     return stopped(model, started, 'you answered No to the plan. Nothing was copied', breaks);
   }
 
-  const iso = await createIsolation({
-    sourceUrl: o.dbUrl,
-    terminate: o.terminate,
-    allowRemote: o.allowRemote,
-    isolateNetwork: o.isolateNetwork,
-    confirmTerminate: (n, apps, db) =>
-      o.confirm.askSeparate(
-        `${n} other connection(s) are open to ${visible(db)} (${apps.length ? apps.map(visible).join(', ') : 'no application name'}). Close them for a moment? They reconnect by themselves. (y/N)`,
-        `closing ${n} other connection(s) to "${visible(db)}" for a moment (local database only)`,
-        Boolean(o.closeSessions),
-        '--close-sessions'
-      ),
-    adminUrl: o.adminUrl,
-    prepareMaster: suite.prepare ? (url) => suite.prepare!(url) : undefined
-  });
+  const prepareMaster = suite.prepare ? (url: string) => suite.prepare!(url) : undefined;
+  const verifyMaster = async (masterUrl: string): Promise<void> => {
+    const g = new Guard({ sourceUrl: masterUrl, allowTerminate: false });
+    const c = await g.connect(masterUrl);
+    try {
+      const diff = policyDifferences(model.policies, (await readCatalogue(c, o.schemas)).policies);
+      if (diff.length) {
+        throw new Error(
+          `the copy built from files does not have the policies of the database, so the breaks would not fit it: ${diff.slice(0, 5).join('; ')}${diff.length > 5 ? `; and ${diff.length - 5} more` : ''}. ` +
+            `Update the migrations, or run without --from-files.`
+        );
+      }
+    } finally {
+      await c.end().catch(() => {});
+    }
+  };
+  let iso: Isolation;
+  if (o.sandbox) {
+    iso = await createSandboxIsolation({
+      dbUrl: o.dbUrl,
+      image: sandboxImageFor(o, facts),
+      files: o.buildFiles ?? null,
+      cwd: o.cwd ?? process.cwd(),
+      isolateNetwork: o.isolateNetwork,
+      masks: o.masks,
+      prepareMaster,
+      verifyMaster
+    });
+  } else {
+    const cwd = o.cwd ?? process.cwd();
+    const files = o.buildFiles ?? null;
+    iso = await createIsolation({
+      sourceUrl: o.dbUrl,
+      terminate: o.terminate,
+      allowRemote: o.allowRemote,
+      isolateNetwork: o.isolateNetwork,
+      confirmTerminate: (n, apps, db) =>
+        o.confirm.askSeparate(
+          `${n} other connection(s) are open to ${visible(db)} (${apps.length ? apps.map(visible).join(', ') : 'no application name'}). Close them for a moment? They reconnect by themselves. (y/N)`,
+          `closing ${n} other connection(s) to "${visible(db)}" for a moment (local database only)`,
+          Boolean(o.closeSessions),
+          '--close-sessions'
+        ),
+      adminUrl: o.adminUrl,
+      masks: o.masks,
+      prepareMaster,
+      ...(files
+        ? {
+            emptyMaster: true,
+            verifyMaster,
+            build: async (masterUrl: string, guard: Guard) => {
+              const m = await guard.connect(masterUrl);
+              try {
+                await loadFiles(m, cwd, files);
+              } finally {
+                await m.end().catch(() => {});
+              }
+            }
+          }
+        : {})
+    });
+  }
   try {
     model.isolation = iso.mode;
+    model.masked = iso.masked;
     model.notes = [...(o.adminNote ? [o.adminNote] : []), ...iso.notes].map((n) => scrubSecrets(n, [o.dbUrl]));
     {
       const copyBase = await iso.withPristine((url) => suite.run(url, { timeoutMs: o.timeoutMs }));
@@ -287,4 +377,28 @@ function stopped(model: RunModel, started: number, why: string, breaks: Break[])
   model.couldNotCheck = `stopped before anything was copied: ${why}.`;
   model.durationMs = Date.now() - started;
   return { model, breaks };
+}
+
+/** The image for the sandbox: --sandbox-image, or the official postgres image of the source's major version. */
+export function sandboxImageFor(o: Pick<RunOptions, 'sandboxImage'>, facts: ServerFacts): string {
+  if (o.sandboxImage) return o.sandboxImage;
+  const major = /^(\d+)/.exec(facts.version)?.[1];
+  if (!major) throw new Error(`could not read the major version from "${facts.version}"; pass --sandbox-image`);
+  return `postgres:${major}`;
+}
+
+/** Plan lines for the new modes. Empty for a default run, so a default plan is unchanged. */
+export function modeLines(o: Pick<RunOptions, 'buildFiles' | 'sandbox' | 'sandboxImage' | 'masks'>): string[] {
+  const out: string[] = [];
+  if (o.buildFiles) out.push(`Copies: built from ${visible(o.buildFiles.description)}. No row of this database is copied.`);
+  if (o.sandbox) {
+    out.push(
+      `Sandbox: the copies live in a Docker container (image ${visible(o.sandboxImage ?? 'postgres:<version of the source>')}, pulled if it is not here), reachable on 127.0.0.1 only. The container is removed when the run ends.` +
+        (o.buildFiles ? '' : ' The rows of this database are streamed into it with pg_dump, in a read-only session.')
+    );
+  }
+  if (o.masks?.length) {
+    out.push(`Masking: ${o.masks.map((m) => visible(maskText(m))).join(', ')} are rewritten in the first copy before any break runs. If one cannot be, the run stops.`);
+  }
+  return out;
 }

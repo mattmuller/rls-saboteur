@@ -57,6 +57,8 @@ export interface FileConfig {
   test?: string;
   threshold?: number;
   skip?: SkipRule[];
+  /** Columns to mask, as schema.table.column or schema.table.column=null. */
+  mask?: string[];
 }
 
 export const CONFIG_FILE = '.rls-saboteur.json';
@@ -69,6 +71,9 @@ export function readFileConfig(cwd: string): FileConfig {
     cfg = JSON.parse(readFileSync(file, 'utf8')) as FileConfig;
   } catch (e) {
     throw new Error(`${CONFIG_FILE} is not valid JSON: ${(e as Error).message}`);
+  }
+  if (cfg.mask !== undefined && (!Array.isArray(cfg.mask) || cfg.mask.some((m) => typeof m !== 'string'))) {
+    throw new Error(`${CONFIG_FILE}: "mask" must be a list of strings like "public.users.email".`);
   }
   for (const s of cfg.skip ?? []) {
     if (!s.policy || !s.reason?.trim()) {
