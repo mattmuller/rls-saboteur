@@ -561,14 +561,14 @@ exit 0
   });
 
   for (const [label, rule, expected] of [
-    ['loopback', 'host all all 127.0.0.1/32 trust', /lets a client in|need no password/],
-    ['one database', 'host template1 all all trust', /could not check that the sandbox asks for a password|need no password|lets a client in/]
+    ['loopback', 'host all all 127.0.0.1/32 trust', /command inside the container failed/],
+    ['one database', 'host template1 all all trust', /command inside the container failed/]
   ] as const) {
-    it(`sandbox-auth-trust: an image with a passwordless host rule (${label}) stops the run with exit 2 and leaves no container`, async () => {
+    it(`sandbox-auth-trust: an image with a passwordless host rule (${label}) whose pg_hba.conf cannot be replaced stops the run with exit 2 and leaves no container`, async () => {
       await makeSource();
       const tag = `rls-saboteur-ci-pg-trust:${label.replace(' ', '-')}`;
       const build = spawnSync('docker', ['build', '-q', '-t', tag, '-'], {
-        input: `FROM ${image}\nRUN printf '#!/bin/sh\\nsed -i "1i ${rule}" "$PGDATA/pg_hba.conf"\\n' > /docker-entrypoint-initdb.d/zz-trust.sh && chmod +x /docker-entrypoint-initdb.d/zz-trust.sh\n`,
+        input: `FROM ${image}\nRUN printf '#!/bin/sh\\nsed -i "1i ${rule}" "$PGDATA/pg_hba.conf"\\nchmod 444 "$PGDATA/pg_hba.conf"\\n' > /docker-entrypoint-initdb.d/zz-trust.sh && chmod +x /docker-entrypoint-initdb.d/zz-trust.sh\n`,
         encoding: 'utf8'
       });
       expect(build.status, build.stderr).toBe(0);
