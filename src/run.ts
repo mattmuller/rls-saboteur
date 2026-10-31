@@ -4,7 +4,7 @@ import { runChecks } from './checks.js';
 import { CONFIG_FILE, type SkipRule, redact, scrubSecrets } from './config.js';
 import { createIsolation, type Isolation } from './isolation.js';
 import { createSandboxIsolation } from './sandbox.js';
-import { type BuildFiles, loadFiles } from './files.js';
+import type { BuildFiles } from './files.js';
 import { type MaskSpec, maskText, validateMasks } from './mask.js';
 import { Guard } from './guard.js';
 import { type Prompter, visible } from './confirm.js';
@@ -79,7 +79,13 @@ export interface RunOutput {
   breaks: Break[];
 }
 
+/** Why --from-files needs --sandbox. The migration and seed files are your code and can do anything their role can. */
+export const FILES_NEED_SANDBOX =
+  '--from-files needs --sandbox. Migration and seed files are your code: on your own server they would run with the rights of your database user ' +
+  'and could change roles or other databases there. In a sandbox container they can only reach the container.';
+
 export async function run(o: RunOptions): Promise<RunOutput> {
+  if (o.buildFiles && !o.sandbox) throw new Error(FILES_NEED_SANDBOX);
   const started = Date.now();
   const model: RunModel = {
     database: redact(o.dbUrl),
@@ -254,8 +260,6 @@ export async function run(o: RunOptions): Promise<RunOutput> {
       verifyMaster
     });
   } else {
-    const cwd = o.cwd ?? process.cwd();
-    const files = o.buildFiles ?? null;
     iso = await createIsolation({
       sourceUrl: o.dbUrl,
       terminate: o.terminate,
@@ -270,21 +274,7 @@ export async function run(o: RunOptions): Promise<RunOutput> {
         ),
       adminUrl: o.adminUrl,
       masks: o.masks,
-      prepareMaster,
-      ...(files
-        ? {
-            emptyMaster: true,
-            verifyMaster,
-            build: async (masterUrl: string, guard: Guard) => {
-              const m = await guard.connect(masterUrl);
-              try {
-                await loadFiles(m, cwd, files);
-              } finally {
-                await m.end().catch(() => {});
-              }
-            }
-          }
-        : {})
+      prepareMaster
     });
   }
   try {
@@ -390,7 +380,13 @@ export function sandboxImageFor(o: Pick<RunOptions, 'sandboxImage'>, facts: Serv
 /** Plan lines for the new modes. Empty for a default run, so a default plan is unchanged. */
 export function modeLines(o: Pick<RunOptions, 'buildFiles' | 'sandbox' | 'sandboxImage' | 'masks'>): string[] {
   const out: string[] = [];
-  if (o.buildFiles) out.push(`Copies: built from ${visible(o.buildFiles.description)}. No row of this database is copied.`);
+  if (o.buildFiles) {
+    out.push(
+      `Copies: built from ${visible(o.buildFiles.description)}. No row of this database is copied. ` +
+        `Those files are your code: they run as the superuser of the container, which can reach the network, and not on your server. ` +
+        `Outbound HTTP is switched off after each file, so a call inside the same file that installs the extension is not stopped.`
+    );
+  }
   if (o.sandbox) {
     out.push(
       `Sandbox: the copies live in a Docker container (image ${visible(o.sandboxImage ?? 'postgres:<version of the source>')}, pulled if it is not here), reachable on 127.0.0.1 only. The container is removed when the run ends.` +

@@ -86,7 +86,7 @@ export interface IsolationOptions {
    * Build mode: the master is created EMPTY (from template0) and this fills it, from files or a dump. The source is not
    * cloned, so no closing of sessions is ever needed. Needs emptyMaster.
    */
-  build?: (masterUrl: string, guard: Guard) => Promise<void>;
+  build?: (masterUrl: string, guard: Guard, between: () => Promise<void>) => Promise<void>;
   emptyMaster?: boolean;
   /** Runs on the built master. A throw stops the run (for example: the files do not rebuild the policies of the database). */
   verifyMaster?: (masterUrl: string) => Promise<void>;
@@ -195,26 +195,28 @@ export async function createIsolation(o: IsolationOptions): Promise<Isolation> {
       );
     }
     const masterUrl = withDatabase(o.sourceUrl, master);
-    if (o.isolateNetwork !== false) {
+    // Switch outbound HTTP off in the master. In build mode this runs AFTER the build, because the net and http
+    // functions only exist once the files or the dump have installed them. It also runs between the files (see below).
+    const isolate = async (): Promise<ReturnType<typeof isolateNetwork> | undefined> => {
+      if (o.isolateNetwork === false) return undefined;
       const m = await guard.connect(withDatabase(o.adminUrl ?? o.sourceUrl, master));
       try {
-        const r = await isolateNetwork(m);
-        notes.push(
-          r.replaced.length
-            ? `Outbound HTTP is switched off in the copies: ${r.replaced.length} function(s) (${r.replaced.slice(0, 6).join(', ')}${r.replaced.length > 6 ? ', ...' : ''}) do nothing there.`
-            : 'Outbound HTTP is switched off in the copies: no pg_net or http functions were found.'
-        );
-        if (r.remaining.length) {
-          notes.push(`Not switched off: ${r.remaining.join(', ')} can still open connections from a copy.`);
-        }
+        return await isolateNetwork(m);
       } finally {
         await m.end().catch(() => {});
       }
+    };
+    if (o.build) await o.build(masterUrl, guard, async () => void (await isolate()));
+    const r = await isolate();
+    if (r) {
+      notes.push(
+        r.replaced.length
+          ? `Outbound HTTP is switched off in the copies: ${r.replaced.length} function(s) (${r.replaced.slice(0, 6).join(', ')}${r.replaced.length > 6 ? ', ...' : ''}) do nothing there.`
+          : 'Outbound HTTP is switched off in the copies: no pg_net or http functions were found.'
+      );
+      if (r.remaining.length) notes.push(`Not switched off: ${r.remaining.join(', ')} can still open connections from a copy.`);
     }
-    if (o.build) {
-      await o.build(masterUrl, guard);
-      if (o.verifyMaster) await o.verifyMaster(masterUrl);
-    }
+    if (o.build && o.verifyMaster) await o.verifyMaster(masterUrl);
     // Masking comes before everything else that reads or copies the master: pgTAP, the baseline and every break copy.
     let masked: MaskedColumn[] = [];
     if (o.masks?.length) {

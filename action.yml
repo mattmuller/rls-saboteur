@@ -31,7 +31,7 @@ inputs:
     description: >
       Version of the rls-saboteur npm package to run. The default is the version this
       release of the action ships with. The release step must keep it equal to package.json.
-    default: '0.2.1'
+    default: '0.3.0'
   close-sessions:
     description: >
       Approve closing other sessions on the CI database for a moment, to take the first copy

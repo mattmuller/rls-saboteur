@@ -16,7 +16,7 @@ import {
 import { applyMasks, maskText, parseMask, scrambleExpr, validateMasks } from '../src/mask.js';
 import { discoverBuildFiles, pgCronHint } from '../src/files.js';
 import { modeLines, policyDifferences, sandboxImageFor } from '../src/run.js';
-import { containerHostFor, rolesScript } from '../src/sandbox.js';
+import { containerHostFor, dumpEnvFor, rolesScript } from '../src/sandbox.js';
 import type { Db } from '../src/guard.js';
 import type { Policy } from '../src/types.js';
 
@@ -137,7 +137,7 @@ describe('mask: parsing', () => {
 });
 
 /** A fake database that answers the mask queries. `s` controls what it says. */
-function fakeDb(s: { exists?: boolean; type?: string; before?: number; updated?: number; left?: number; noSuper?: boolean; relkind?: string; generated?: string }): { db: Db; log: string[] } {
+function fakeDb(s: { exists?: boolean; type?: string; before?: number; updated?: number; left?: number; noSuper?: boolean; statsLeft?: number; relkind?: string; generated?: string }): { db: Db; log: string[] } {
   const log: string[] = [];
   const db: Db = {
     async end() {},
@@ -147,6 +147,7 @@ function fakeDb(s: { exists?: boolean; type?: string; before?: number; updated?:
         if (s.exists === false) return { rows: [], rowCount: 0 } as never;
         return { rows: [{ relkind: s.relkind ?? 'r', type: s.type ?? 'text', base: s.type ?? 'text', generated: s.generated ?? '', identity: '', maxlen: null }], rowCount: 1 } as never;
       }
+      if (/from pg_stats s/.test(text)) return { rows: [{ n: s.statsLeft ?? 0 }], rowCount: 1 } as never;
       if (/session_replication_role/.test(text) && s.noSuper) throw new Error('permission denied to set parameter');
       if (/select count\(\*\) as n from _sab_mask/.test(text)) return { rows: [{ n: s.before ?? 3 }], rowCount: 1 } as never;
       if (/^update /.test(text.trim())) return { rows: [], rowCount: s.updated ?? s.before ?? 3 } as never;
@@ -166,6 +167,13 @@ describe('mask: it fails closed', () => {
     expect(log).toContain('commit');
     expect(log.findIndex((l) => /^update/.test(l))).toBeGreaterThan(log.indexOf('begin'));
     expect(log.some((l) => /row_security = off/.test(l))).toBe(true);
+    // After the commit: rewrite the table (dead rows, indexes) and rebuild the statistics, then look at them.
+    const commit = log.indexOf('commit');
+    expect(log.findIndex((l) => /^vacuum \(full, analyze\)/.test(l))).toBeGreaterThan(commit);
+    expect(log.findIndex((l) => /from pg_stats s/.test(l))).toBeGreaterThan(log.findIndex((l) => /^vacuum/.test(l)));
+  });
+  it('mask-stats: an original value still in the planner statistics stops the run', async () => {
+    await expect(applyMasks(fakeDb({ statsLeft: 2 }).db, spec, 's')).rejects.toThrow(/2 original value\(s\).*planner statistics/);
   });
   it('mask-closed: a column that does not exist stops the run', async () => {
     await expect(applyMasks(fakeDb({ exists: false }).db, spec, 's')).rejects.toThrow(/does not exist/);
@@ -263,6 +271,13 @@ describe('plan lines and helpers', () => {
     expect(containerHostFor('localhost')).toBe('host.docker.internal');
     expect(containerHostFor('supabase_db_x')).toBe('supabase_db_x');
   });
+  it('sandbox-dump-readonly: the dump session asks the server to refuse writes, and names the container host', () => {
+    const e = dumpEnvFor('postgres://me:s%40cret@127.0.0.1:5432/app');
+    expect(e.PGOPTIONS).toBe('-c default_transaction_read_only=on');
+    expect(e.PGHOST).toBe('host.docker.internal');
+    expect(e.PGPASSWORD).toBe('s@cret');
+    expect(e.PGDATABASE).toBe('app');
+  });
   it('sandbox roles script: no superuser, no password, system roles skipped', () => {
     const base = { rolinherit: true, rolcreaterole: false, rolcreatedb: false, rolcanlogin: false, rolreplication: false, rolbypassrls: false };
     const sql = rolesScript([{ rolname: 'app_user', ...base }, { rolname: 'pg_monitor', ...base }, { rolname: 'postgres', ...base }, { rolname: "o'q", ...base, rolcanlogin: true }], [{ role: 'app_user', member: "o'q" }], 'postgres');
@@ -271,5 +286,15 @@ describe('plan lines and helpers', () => {
     expect(sql).not.toMatch(/(?<!NO)SUPERUSER|password/i);
     expect(sql).toContain(`'o''q'`);
     expect(sql).toContain('grant "app_user" to "o\'q"');
+  });
+  it('sandbox-role-names: a name with $, a backslash or a line break is refused, and the tag changes every time', () => {
+    const base = { rolinherit: true, rolcreaterole: false, rolcreatedb: false, rolcanlogin: false, rolreplication: false, rolbypassrls: false };
+    for (const bad of ['x$sab$y', 'a\\b', 'a\nb', 'a\rb', 'a\u2028b', 'a\u0000b']) {
+      expect(() => rolesScript([{ rolname: bad, ...base }], [], 'postgres'), JSON.stringify(bad)).toThrow(/does not copy such names/);
+      expect(() => rolesScript([{ rolname: 'ok', ...base }], [{ role: 'ok', member: bad }], 'postgres'), JSON.stringify(bad)).toThrow(/does not copy such names/);
+    }
+    const one = rolesScript([{ rolname: 'ok', ...base }], [], 'postgres');
+    const two = rolesScript([{ rolname: 'ok', ...base }], [], 'postgres');
+    expect(/\$(sab[0-9a-f]{16})\$/.exec(one)![1]).not.toBe(/\$(sab[0-9a-f]{16})\$/.exec(two)![1]);
   });
 });

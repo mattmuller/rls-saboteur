@@ -146,9 +146,28 @@ async function waitReady(port: number, password: string, name: string): Promise<
 }
 
 /** Text of a role script: create the roles the source has and the container lacks, without passwords or superuser. */
+/**
+ * A role name goes into SQL that psql reads, so a name that could end a quoted string, start a psql meta-command or hide
+ * a line is refused, never quoted around. Postgres allows such names; the tool does not copy them.
+ */
+export function unsafeRoleName(name: string): boolean {
+  return /[$\\\u0000\r\n\u2028\u2029]/.test(name);
+}
+
 export function rolesScript(rows: { rolname: string; rolinherit: boolean; rolcreaterole: boolean; rolcreatedb: boolean; rolcanlogin: boolean; rolreplication: boolean; rolbypassrls: boolean }[], members: { role: string; member: string }[], skip: string): string {
   const lit = (s: string): string => `'${s.replace(/'/g, "''")}'`;
+  // A fresh tag for every script: a role name cannot be written to match it, and names holding $ are refused anyway.
+  const tag = `sab${randomBytes(8).toString('hex')}`;
   const out: string[] = [];
+  for (const name of [...rows.map((r) => r.rolname), ...members.flatMap((m) => [m.role, m.member])]) {
+    if (name === skip || name.startsWith('pg_')) continue;
+    if (unsafeRoleName(name)) {
+      throw new Error(
+        `sandbox: the role "${name.replace(/[^\x20-\x7e]/g, '?')}" has a name with a $, a backslash or a line break in it. ` +
+          `The sandbox does not copy such names, because they could change the script that creates roles. Rename the role, or use --from-files.`
+      );
+    }
+  }
   for (const r of rows) {
     if (r.rolname === skip || r.rolname.startsWith('pg_')) continue;
     const flags = [
@@ -160,13 +179,29 @@ export function rolesScript(rows: { rolname: string; rolinherit: boolean; rolcre
       r.rolreplication ? 'REPLICATION' : 'NOREPLICATION',
       r.rolbypassrls ? 'BYPASSRLS' : 'NOBYPASSRLS'
     ].join(' ');
-    out.push(`do $sab$ begin if not exists (select 1 from pg_roles where rolname = ${lit(r.rolname)}) then create role ${qi(r.rolname)} ${flags}; end if; end $sab$;`);
+    out.push(`do $${tag}$ begin if not exists (select 1 from pg_roles where rolname = ${lit(r.rolname)}) then create role ${qi(r.rolname)} ${flags}; end if; end $${tag}$;`);
   }
   for (const m of members) {
     if (m.role.startsWith('pg_') || m.member.startsWith('pg_') || m.role === skip || m.member === skip) continue;
-    out.push(`do $sab$ begin grant ${qi(m.role)} to ${qi(m.member)}; exception when others then null; end $sab$;`);
+    out.push(`do $${tag}$ begin grant ${qi(m.role)} to ${qi(m.member)}; exception when others then null; end $${tag}$;`);
   }
   return out.join('\n') + '\n';
+}
+
+/**
+ * The environment of the pg_dump process. PGOPTIONS makes the server itself refuse a write on the dump session,
+ * as the guard does for the source session.
+ */
+export function dumpEnvFor(dbUrl: string): Record<string, string> {
+  const u = new URL(dbUrl);
+  return {
+    PGPASSWORD: decodeURIComponent(u.password),
+    PGOPTIONS: '-c default_transaction_read_only=on',
+    PGHOST: containerHostFor(decodeURIComponent(u.hostname)),
+    PGPORT: u.port || '5432',
+    PGUSER: decodeURIComponent(u.username),
+    PGDATABASE: databaseOf(dbUrl)
+  };
 }
 
 /** The host name a container uses to reach the source on the host machine. */
@@ -269,11 +304,11 @@ export async function createSandboxIsolation(o: SandboxIsolationOptions): Promis
       cleanupWaitMs: o.cleanupWaitMs,
       manageSignals: false,
       emptyMaster: true,
-      build: async (masterUrl, guard) => {
+      build: async (masterUrl, guard, between) => {
         if (o.files) {
           const m = await guard.connect(masterUrl);
           try {
-            await loadFiles(m, o.cwd, o.files);
+            await loadFiles(m, o.cwd, o.files, between);
           } finally {
             await m.end().catch(() => {});
           }
@@ -339,19 +374,11 @@ async function dumpInto(sb: Sandbox, dbUrl: string, masterDb: string, urls: stri
     '-h', '127.0.0.1', '-U', sb.user, '-d', db
   ];
   await pipeInto(sb, null, { args: psqlArgs('postgres', false), input: script }, urls);
-  const dumpEnv = {
-    PGPASSWORD: decodeURIComponent(u.password),
-    // The server itself refuses a write on the dump session, as it does for the source session of the guard.
-    PGOPTIONS: '-c default_transaction_read_only=on',
-    PGHOST: containerHostFor(host),
-    PGPORT: u.port || '5432',
-    PGUSER: decodeURIComponent(u.username),
-    PGDATABASE: databaseOf(dbUrl)
-  };
+  const dumpEnv = dumpEnvFor(dbUrl);
   await pipeInto(
     sb,
     {
-      args: ['exec', '-e', 'PGPASSWORD', '-e', 'PGOPTIONS', '-e', 'PGHOST', '-e', 'PGPORT', '-e', 'PGUSER', '-e', 'PGDATABASE', sb.name, 'pg_dump', '--no-publications', '--no-subscriptions', '--no-tablespaces'],
+      args: ['exec', '-e', 'PGPASSWORD', '-e', 'PGOPTIONS', '-e', 'PGHOST', '-e', 'PGPORT', '-e', 'PGUSER', '-e', 'PGDATABASE', sb.name, 'pg_dump', '--no-publications', '--no-subscriptions', '--no-tablespaces', '--disable-triggers'],
       env: dumpEnv
     },
     { args: psqlArgs(masterDb, true) },

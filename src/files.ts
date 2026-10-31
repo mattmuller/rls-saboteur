@@ -45,7 +45,7 @@ export function discoverBuildFiles(cwd: string, migrationsDir?: string, seedFile
  * Runs the files, in order, on a database that is a labelled copy. Each file is one simple-protocol query, so it may hold
  * many statements. A failure names the file and stops the run.
  */
-export async function loadFiles(db: Db, cwd: string, files: BuildFiles): Promise<void> {
+export async function loadFiles(db: Db, cwd: string, files: BuildFiles, between?: () => Promise<void>): Promise<void> {
   for (const f of [...files.migrations, ...(files.seed ? [files.seed] : [])]) {
     const sql = readFileSync(join(cwd, f), 'utf8');
     try {
@@ -53,6 +53,8 @@ export async function loadFiles(db: Db, cwd: string, files: BuildFiles): Promise
     } catch (e) {
       throw new Error(`building the copy from ${f} failed: ${(e as Error).message}${pgCronHint((e as Error).message)}`);
     }
+    // After every file, switch outbound HTTP off, so the next file (the seed above all) cannot call out.
+    if (between) await between();
   }
 }
 

@@ -120,6 +120,18 @@ export function scrambleExpr(col: string, f: Pick<ColumnFacts, 'base' | 'type' |
   throw new Error(`no scramble for type ${f.type}`);
 }
 
+/** Counts original values (from the session table _sab_mask) still held in the statistics of a column. Zero is the only pass. */
+export const STATS_SQL = `select (
+    (select count(*) from pg_stats s,
+            unnest(coalesce(s.most_common_vals::text::text[], '{}') || coalesce(s.histogram_bounds::text::text[], '{}')) u(v)
+      where s.schemaname = $1 and s.tablename = $2 and s.attname = $3 and u.v in (select v::text from _sab_mask))
+  + (select count(*) from pg_stats_ext s, unnest(s.most_common_vals) u(v)
+      where s.schemaname = $1 and s.tablename = $2 and $3 = any (s.attnames) and u.v in (select v::text from _sab_mask))
+  + (select count(*) from pg_stats_ext_exprs s,
+            unnest(coalesce(s.most_common_vals::text::text[], '{}') || coalesce(s.histogram_bounds::text::text[], '{}')) u(v)
+      where s.schemaname = $1 and s.tablename = $2 and u.v in (select v::text from _sab_mask))
+  )::int as n`;
+
 export interface MaskedColumn {
   column: string;
   strategy: MaskStrategy;
@@ -143,31 +155,47 @@ export async function applyMasks(db: Db, masks: MaskSpec[], salt: string = rando
     if (why) throw new Error(`masking stopped: ${why}`);
     const tbl = `${qi(m.schema)}.${qi(m.table)}`;
     const col = qi(m.column);
-    await db.query('begin');
+    // The snapshot lives for the whole column, past the commit, so the statistics can be checked against it.
+    await db.query('drop table if exists pg_temp._sab_mask');
     try {
-      await db.query('set local row_security = off');
+      await db.query('begin');
       try {
-        await db.query("set local session_replication_role = 'replica'");
+        await db.query('set local row_security = off');
+        try {
+          await db.query("set local session_replication_role = 'replica'");
+        } catch (e) {
+          throw new Error(`masking needs a superuser to switch triggers off while it rewrites ${label} (${(e as Error).message})`);
+        }
+        await db.query(`create temp table _sab_mask as select ${col} as v from ${tbl} where ${col} is not null`);
+        const before = Number((await db.query('select count(*) as n from _sab_mask')).rows[0].n);
+        const set = m.strategy === 'null' ? 'null' : scrambleExpr(col, f, salt);
+        const upd = await db.query(`update ${tbl} set ${col} = ${set} where ${col} is not null`);
+        if (Number(upd.rowCount) !== before) {
+          throw new Error(`rewrote ${upd.rowCount} row(s) of ${label}, expected ${before}`);
+        }
+        const left =
+          m.strategy === 'null'
+            ? Number((await db.query(`select count(*) as n from ${tbl} where ${col} is not null`)).rows[0].n)
+            : Number((await db.query(`select count(*) as n from ${tbl} where ${col} is not null and ${col} in (select v from _sab_mask)`)).rows[0].n);
+        if (left !== 0) throw new Error(`${left} row(s) of ${label} still hold an original value after the rewrite`);
+        await db.query('commit');
+        done.push({ column: label, strategy: m.strategy, rows: before });
       } catch (e) {
-        throw new Error(`masking needs a superuser to switch triggers off while it rewrites ${label} (${(e as Error).message})`);
+        await db.query('rollback').catch(() => {});
+        throw e;
       }
-      await db.query(`create temp table _sab_mask on commit drop as select ${col} as v from ${tbl} where ${col} is not null`);
-      const before = Number((await db.query('select count(*) as n from _sab_mask')).rows[0].n);
-      const set = m.strategy === 'null' ? 'null' : scrambleExpr(col, f, salt);
-      const upd = await db.query(`update ${tbl} set ${col} = ${set} where ${col} is not null`);
-      if (Number(upd.rowCount) !== before) {
-        throw new Error(`rewrote ${upd.rowCount} row(s) of ${label}, expected ${before}`);
+      // The rewrite leaves the old values in dead rows, in index pages and in the planner statistics (pg_statistic holds
+      // sample values and histogram bounds). A copy is made from these files, so all three must go before any copy.
+      // VACUUM cannot run in a transaction.
+      await db.query(`vacuum (full, analyze) ${tbl}`);
+      const stats = Number((await db.query(STATS_SQL, [m.schema, m.table, m.column])).rows[0].n);
+      if (stats !== 0) {
+        throw new Error(`${stats} original value(s) of ${label} are still in the planner statistics (pg_stats, pg_stats_ext) after VACUUM FULL and ANALYZE`);
       }
-      const left =
-        m.strategy === 'null'
-          ? Number((await db.query(`select count(*) as n from ${tbl} where ${col} is not null`)).rows[0].n)
-          : Number((await db.query(`select count(*) as n from ${tbl} where ${col} is not null and ${col} in (select v from _sab_mask)`)).rows[0].n);
-      if (left !== 0) throw new Error(`${left} row(s) of ${label} still hold an original value after the rewrite`);
-      await db.query('commit');
-      done.push({ column: label, strategy: m.strategy, rows: before });
     } catch (e) {
-      await db.query('rollback').catch(() => {});
       throw new Error(`masking ${label} failed, so the run stops before any test: ${(e as Error).message}`);
+    } finally {
+      await db.query('drop table if exists pg_temp._sab_mask').catch(() => {});
     }
   }
   return done;
