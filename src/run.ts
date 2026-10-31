@@ -55,6 +55,8 @@ export interface RunOptions {
   sandbox?: boolean;
   /** --sandbox-image. Default: postgres:<major version of the source>. */
   sandboxImage?: string;
+  /** --sandbox-host-network: allow pg_dump on the host network for a --sandbox-image you chose. */
+  sandboxHostNetwork?: boolean;
   /** --mask: columns scrambled in the first copy before any break runs. */
   masks?: MaskSpec[];
 }
@@ -252,6 +254,7 @@ export async function run(o: RunOptions): Promise<RunOutput> {
     iso = await createSandboxIsolation({
       dbUrl: o.dbUrl,
       image: sandboxImageFor(o, facts),
+      hostNetworkDump: hostNetworkAllowed(o),
       files: o.buildFiles ?? null,
       schemas: o.schemas,
       cwd: o.cwd ?? process.cwd(),
@@ -370,6 +373,11 @@ function stopped(model: RunModel, started: number, why: string, breaks: Break[])
   return { model, breaks };
 }
 
+/** pg_dump may use the host network on its own only for the default image. A chosen image needs --sandbox-host-network. */
+export function hostNetworkAllowed(o: Pick<RunOptions, 'sandboxImage' | 'sandboxHostNetwork'>): boolean {
+  return o.sandboxHostNetwork === true || !o.sandboxImage;
+}
+
 /** The image for the sandbox: --sandbox-image, or the official postgres image of the source's major version. */
 export function sandboxImageFor(o: Pick<RunOptions, 'sandboxImage'>, facts: ServerFacts): string {
   if (o.sandboxImage) return o.sandboxImage;
@@ -379,7 +387,7 @@ export function sandboxImageFor(o: Pick<RunOptions, 'sandboxImage'>, facts: Serv
 }
 
 /** Plan lines for the new modes. Empty for a default run, so a default plan is unchanged. */
-export function modeLines(o: Pick<RunOptions, 'buildFiles' | 'sandbox' | 'sandboxImage' | 'masks'>): string[] {
+export function modeLines(o: Pick<RunOptions, 'buildFiles' | 'sandbox' | 'sandboxImage' | 'sandboxHostNetwork' | 'masks'>): string[] {
   const out: string[] = [];
   if (o.buildFiles) {
     out.push(
@@ -393,7 +401,10 @@ export function modeLines(o: Pick<RunOptions, 'buildFiles' | 'sandbox' | 'sandbo
       `Sandbox: the copies live in a Docker container (image ${visible(o.sandboxImage ?? 'postgres:<version of the source>')}, pulled if it is not here). The container is removed when the run ends.` +
         (o.buildFiles
           ? ' It has no network at all (docker --network none) and no published port. This tool reaches it through docker exec. Your files run inside it as the container superuser, so they can only reach the container.'
-          : ' It sits on the default Docker network and is reachable on 127.0.0.1 only. pg_dump runs in it and reads your database in a read-only session, so the container can reach your machine and the internet. Nothing of yours runs there except the SQL restored from your own database, with the triggers created after the data, so none fires.')
+          : ' It sits on the default Docker network and is reachable on 127.0.0.1 only. pg_dump runs in it and reads your database in a read-only session, so the container can reach your machine and the internet. Nothing of yours runs there except the SQL restored from your own database, with the triggers created after the data, so none fires.' +
+            (o.sandboxImage && !o.sandboxHostNetwork
+              ? ' If this container cannot reach your database on 127.0.0.1 (Docker Engine for Linux), the run stops: pg_dump on the host network is allowed for the default image only, or with --sandbox-host-network.'
+              : ' If this container cannot reach your database on 127.0.0.1 (Docker Engine for Linux), pg_dump runs in a SECOND container on the HOST network (docker --network host --entrypoint pg_dump, same image, removed with the sandbox). That container can reach everything on your machine\'s loopback. The container that holds the copies never gets the host network.'))
     );
   }
   if (o.masks?.length) {

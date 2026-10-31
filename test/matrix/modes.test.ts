@@ -387,7 +387,8 @@ describe.skipIf(!superUrl)('build modes', () => {
 });
 
 describe.skipIf(!superUrl || !image)('sandbox', () => {
-  const sbArgs = (extra: string[]): string[] => ['--sandbox', '--sandbox-image', image!, '--jobs', '1', ...extra];
+  // The test image is a chosen image, so a dump on Linux needs --sandbox-host-network (the source is published on loopback only).
+  const sbArgs = (extra: string[]): string[] => ['--sandbox', '--sandbox-image', image!, '--jobs', '1', ...(extra.includes('--from-files') ? [] : ['--sandbox-host-network']), ...extra];
   beforeAll(async () => {
     const c = await open(urlFor('postgres'));
     const r = await c.query(`select current_setting('cluster_name') as name`);
@@ -855,7 +856,7 @@ describe.skipIf(!supaImage)('sandbox on the Supabase image', () => {
     writeFileSync(obs, '');
     const r = spawnSync(
       'node',
-      [cli, '--db-url', src, '--runner', 'psql', '--sandbox', '--sandbox-image', supaImage!, '--yes', '--jobs', '1', '--report', join(scratch, `${observe}.md`), '--json-file', join(scratch, `${observe}.json`), ...extra],
+      [cli, '--db-url', src, '--runner', 'psql', '--sandbox', '--sandbox-image', supaImage!, ...(extra.includes('--from-files') ? [] : ['--sandbox-host-network']), '--yes', '--jobs', '1', '--report', join(scratch, `${observe}.md`), '--json-file', join(scratch, `${observe}.json`), ...extra],
       { cwd: dir, encoding: 'utf8', env: { ...process.env, OBSERVE_FILE: obs }, timeout: 600_000 }
     );
     return { status: r.status, out: `${r.stdout}\n${r.stderr}`, observed: readFileSync(obs, 'utf8') };

@@ -7,7 +7,8 @@ import { hostId } from './guard.js';
  * checkDockerArgs BEFORE it runs, with no shell. A command that is not in the list is refused.
  *
  * The rules: the tool starts one container shape (loopback port, no mounts, no extra privileges, no host network),
- * runs only pg_dump, psql and pg_isready inside it, and removes only containers that carry its name and labels and that
+ * runs only pg_dump, psql and pg_isready inside it, and has ONE other shape: a pg_dump helper on the host network (see
+ * checkDumpHelper), used only when the caller has allowed it. The container that holds the copies never gets the host network, and removes only containers that carry its name and labels and that
  * belong to this run, or to a dead process of this host.
  */
 
@@ -165,10 +166,10 @@ export function checkDockerArgs(args: string[], ownName: string): void {
 /**
  * The second container shape. On Docker Engine for Linux a container on the bridge cannot reach a database that listens on
  * 127.0.0.1 of the host. For that one case only, pg_dump runs in a helper container on the host network, and its output is
- * piped into the sandbox. The helper holds no password of its own, runs nothing but pg_dump with a fixed set of options, is
+ * piped into the sandbox. The helper holds no password of its own, runs nothing but pg_dump (set as the entrypoint) with a fixed set of options, is
  * labelled like the sandbox so the sweep and the watchdog cover it, and is removed when it ends (--rm).
  *   docker run --rm --name NAME-dump --label x4 --network host -e PGPASSWORD -e PGOPTIONS -e PGHOST -e PGPORT -e PGUSER
- *     -e PGDATABASE IMAGE pg_dump [--no-publications] [--no-subscriptions] [--no-tablespaces] [--schema=NAME]...
+ *     -e PGDATABASE --entrypoint pg_dump IMAGE [--no-publications] [--no-subscriptions] [--no-tablespaces] [--schema=NAME]...
  */
 function checkDumpHelper(rest: string[], ownName: string): void {
   const same = (a: string[], b: string[]): boolean => a.length === b.length && a.every((x, i) => x === b[i]);
@@ -178,11 +179,13 @@ function checkDumpHelper(rest: string[], ownName: string): void {
   const env = ['PGPASSWORD', 'PGOPTIONS', 'PGHOST', 'PGPORT', 'PGUSER', 'PGDATABASE'].flatMap((v) => ['-e', v]);
   const want = [...head, ...env];
   if (!same(rest.slice(0, want.length), want)) throw new DockerGuardError('the dump helper has a shape the tool does not send');
-  const image = rest[want.length];
+  // The image's own entrypoint script must not run on the host network: pg_dump is the entrypoint, not a command after it.
+  const entry = rest.slice(want.length, want.length + 2);
+  if (!same(entry, ['--entrypoint', 'pg_dump'])) throw new DockerGuardError('the dump helper must replace the image entrypoint with pg_dump');
+  const image = rest[want.length + 2];
   if (!image || image.startsWith('-') || !IMAGE_PATTERN.test(image)) throw new DockerGuardError('the dump helper image is not a plain image name');
-  if (rest[want.length + 1] !== 'pg_dump') throw new DockerGuardError('the dump helper may run only pg_dump');
   const fixed = new Set(['--no-publications', '--no-subscriptions', '--no-tablespaces']);
-  for (const a of rest.slice(want.length + 2)) {
+  for (const a of rest.slice(want.length + 3)) {
     if (!fixed.has(a) && !/^--schema=[^\s\u0000]+$/.test(a)) throw new DockerGuardError(`the dump helper may not pass "${a.slice(0, 20)}" to pg_dump`);
   }
 }

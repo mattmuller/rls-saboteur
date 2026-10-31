@@ -61,6 +61,8 @@ Options
   --sandbox             Run the copies in a throwaway Docker container (127.0.0.1 only) instead of on the server
                         that holds your database. The rows are streamed in with pg_dump unless --from-files is given.
   --sandbox-image <i>   Image for --sandbox. Default: postgres:<major version of your database>
+  --sandbox-host-network  With --sandbox and a dump: allow pg_dump to run on the host network when the container cannot reach a
+                        database on 127.0.0.1 (Docker Engine for Linux). Automatic for the default image only.
   --timeout <seconds>   Per test run. Default: 600
   --filter <text>       Only breaks whose id contains this text
   --checks-only         Run only the checks that need no tests
@@ -101,6 +103,7 @@ async function main(): Promise<number> {
       mask: { type: 'string', multiple: true },
       sandbox: { type: 'boolean' },
       'sandbox-image': { type: 'string' },
+      'sandbox-host-network': { type: 'boolean' },
       timeout: { type: 'string' },
       filter: { type: 'string' },
       'checks-only': { type: 'boolean' },
@@ -155,6 +158,8 @@ async function main(): Promise<number> {
   const fromFiles = Boolean(v['from-files']);
   const sandbox = Boolean(v.sandbox);
   if (!fromFiles && (v['migrations-dir'] !== undefined || v['seed-file'] !== undefined)) throw new Error('--migrations-dir and --seed-file need --from-files.');
+  if (!sandbox && v['sandbox-host-network']) throw new Error('--sandbox-host-network needs --sandbox.');
+  if (fromFiles && v['sandbox-host-network']) throw new Error('--sandbox-host-network is for a dump. With --from-files nothing reaches your database.');
   if (!sandbox && v['sandbox-image'] !== undefined) throw new Error('--sandbox-image needs --sandbox.');
   if (sandbox && v['admin-url']) throw new Error('--admin-url is not used with --sandbox: the container is the server that makes the copies.');
   if (v['sandbox-image'] !== undefined && (!IMAGE_PATTERN.test(v['sandbox-image']) || v['sandbox-image'].startsWith('-'))) {
@@ -241,6 +246,7 @@ async function main(): Promise<number> {
     buildFiles,
     sandbox,
     sandboxImage: v['sandbox-image'],
+    sandboxHostNetwork: Boolean(v['sandbox-host-network']),
     masks,
     progress: (line) => {
       if (tty) process.stderr.write(`\r\x1b[K${line}`);

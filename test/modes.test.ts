@@ -16,9 +16,9 @@ import {
 } from '../src/docker.js';
 import { applyMasks, maskText, parseMask, scrambleExpr, validateMasks } from '../src/mask.js';
 import { discoverBuildFiles, pgCronHint } from '../src/files.js';
-import { modeLines, policyDifferences, sandboxImageFor } from '../src/run.js';
+import { hostNetworkAllowed, modeLines, policyDifferences, sandboxImageFor } from '../src/run.js';
 import { Readable } from 'node:stream';
-import { PASSWORDLESS_RULES_SQL, SANDBOX_HBA, notValidForeignKeys, assertAuthEnforced, assertNoPasswordlessHostRules, containerHostFor, dumpEnvFor, rolesScript } from '../src/sandbox.js';
+import { PASSWORDLESS_RULES_SQL, SANDBOX_HBA, notValidForeignKeys, assertAuthEnforced, assertNoPasswordlessHostRules, containerHostFor, decideDumpNetwork, dumpEnvFor, rolesScript } from '../src/sandbox.js';
 import type { Db } from '../src/guard.js';
 import type { Policy } from '../src/types.js';
 
@@ -62,22 +62,60 @@ describe('docker guard', () => {
   it('docker guard: the dump helper runs only pg_dump, on the host network, with the tool\'s labels', () => {
     const env = ['PGPASSWORD', 'PGOPTIONS', 'PGHOST', 'PGPORT', 'PGUSER', 'PGDATABASE'].flatMap((v) => ['-e', v]);
     const helper = `${name}-dump`;
-    const good = ['run', '--rm', '--name', helper, ...labels, '--network', 'host', ...env, 'postgres:17', 'pg_dump', '--no-publications', '--schema=public'];
+    const good = ['run', '--rm', '--name', helper, ...labels, '--network', 'host', ...env, '--entrypoint', 'pg_dump', 'postgres:17', '--no-publications', '--schema=public'];
     expect(() => checkDockerArgs(good, name)).not.toThrow();
     expect(() => checkDockerArgs(['rm', '-f', '-v', helper], name)).not.toThrow();
     const bads: string[][] = [
-      good.map((x) => (x === 'pg_dump' ? 'psql' : x)),
+      good.map((x) => (x === 'pg_dump' ? 'psql' : x)), // other entrypoint
+      good.filter((x, i) => !(x === '--entrypoint' || good[i - 1] === '--entrypoint')), // image entrypoint script would run on the host network
+      [...good.slice(0, good.indexOf('postgres:17') + 1), 'pg_dump', '--no-publications'], // command word after the image
+      good.map((x) => (x === '--entrypoint' ? '--entrypoint=sh' : x)),
       [...good, '--file=/etc/passwd'],
       [...good, '-f', '/x'],
       good.map((x) => (x === 'host' ? 'bridge' : x)),
       good.filter((x) => x !== '--rm'),
-      [...good.slice(0, good.indexOf('postgres:17')), '-v', '/:/h', 'postgres:17', 'pg_dump'],
+      [...good.slice(0, good.indexOf('--entrypoint')), '-v', '/:/h', '--entrypoint', 'pg_dump', 'postgres:17'],
       good.map((x) => (x === helper ? `${name}-other` : x)),
       good.map((x) => (x === 'PGPASSWORD' ? 'PATH' : x))
     ];
     for (const b of bads) expect(() => checkDockerArgs(b, name), b.join(' ')).toThrow(DockerGuardError);
     // The helper name is accepted only for the sandbox of this run.
     expect(() => checkDockerArgs(good, `rls-saboteur-sandbox-${hostId()}-1-${'a'.repeat(16)}`)).toThrow(DockerGuardError);
+  });
+  it('docker guard: the container that holds the copies never gets the host network, even with the helper shape allowed', () => {
+    for (const net of ['host', 'container:x']) {
+      const run = ['run', '-d', '--rm', '--name', name, ...labels, '-e', 'POSTGRES_PASSWORD', '-e', 'POSTGRES_INITDB_ARGS', '--network', net, 'postgres:17'];
+      expect(() => checkDockerArgs(run, name), net).toThrow(DockerGuardError);
+    }
+    expect(() => checkDockerArgs(runArgs(['--network', 'host']), name)).toThrow(DockerGuardError);
+    // Only the helper's own name can carry --network host.
+    const env = ['PGPASSWORD', 'PGOPTIONS', 'PGHOST', 'PGPORT', 'PGUSER', 'PGDATABASE'].flatMap((v) => ['-e', v]);
+    expect(() => checkDockerArgs(['run', '--rm', '--name', name, ...labels, '--network', 'host', ...env, '--entrypoint', 'pg_dump', 'postgres:17'], name)).toThrow(DockerGuardError);
+  });
+  it('host network is chosen only by pg_isready exit 2, and only when allowed', () => {
+    expect(decideDumpNetwork(0, '', false)).toBe('direct');
+    expect(decideDumpNetwork(1, '', false)).toBe('direct');
+    expect(decideDumpNetwork(2, '', true)).toBe('host');
+    expect(() => decideDumpNetwork(2, '', false)).toThrow(/--sandbox-host-network/);
+    // A docker failure, a missing program or no attempt is an error, never an escalation, even when allowed.
+    for (const code of [3, 125, 126, 127, 137, null]) expect(() => decideDumpNetwork(code, 'Error response from daemon', true), String(code)).toThrow(/could not check/);
+  });
+  it('host network for pg_dump is automatic for the default image only', () => {
+    expect(hostNetworkAllowed({})).toBe(true);
+    expect(hostNetworkAllowed({ sandboxImage: 'my/image:1' })).toBe(false);
+    expect(hostNetworkAllowed({ sandboxImage: 'postgres:17' })).toBe(false); // named by the user: needs the flag too
+    expect(hostNetworkAllowed({ sandboxImage: 'my/image:1', sandboxHostNetwork: true })).toBe(true);
+  });
+  it('the plan says that pg_dump may run on the host network, and what a chosen image needs', () => {
+    const dflt = modeLines({ sandbox: true }).join('\n');
+    expect(dflt).toMatch(/HOST network/);
+    expect(dflt).toMatch(/--entrypoint pg_dump/);
+    const chosen = modeLines({ sandbox: true, sandboxImage: 'my/image:1' }).join('\n');
+    expect(chosen).toMatch(/--sandbox-host-network/);
+    expect(chosen).not.toMatch(/runs in a SECOND container/);
+    expect(modeLines({ sandbox: true, sandboxImage: 'my/image:1', sandboxHostNetwork: true }).join('\n')).toMatch(/SECOND container on the HOST network/);
+    // --from-files has no dump, so no host network is mentioned.
+    expect(modeLines({ sandbox: true, buildFiles: { description: 'x' } as never }).join('\n')).not.toMatch(/HOST network/);
   });
   it('docker guard: the files shape has no network at all, and nothing else is accepted in its place', () => {
     const none = ['run', '-d', '--rm', '--name', name, ...labels, '-e', 'POSTGRES_PASSWORD', '-e', 'POSTGRES_INITDB_ARGS', '--network', 'none', 'postgres:17'];

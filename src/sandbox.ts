@@ -458,6 +458,8 @@ export interface SandboxIsolationOptions {
   cleanupWaitMs?: number;
   /** The schemas to cover (--schemas). A dump of a database with managed schemas is limited to these. */
   schemas?: string[];
+  /** Allow pg_dump to run in a helper container on the host network when the container cannot reach a loopback source. */
+  hostNetworkDump?: boolean;
 }
 
 export async function createSandboxIsolation(o: SandboxIsolationOptions): Promise<Isolation> {
@@ -499,6 +501,7 @@ export async function createSandboxIsolation(o: SandboxIsolationOptions): Promis
     throw e;
   }
   const box = sb;
+  let hostNetworkUsed = false;
   const afterCleanup = async (): Promise<void> => {
     const gone = await box.remove();
     uninstall();
@@ -530,7 +533,9 @@ export async function createSandboxIsolation(o: SandboxIsolationOptions): Promis
             await m.end().catch(() => {});
           }
         } else {
-          await dumpInto(box, o.dbUrl, databaseOf(masterUrl), sourceGuardUrls, box.managed ? (o.schemas?.length ? o.schemas : ['public']) : null);
+          await dumpInto(box, o.dbUrl, databaseOf(masterUrl), sourceGuardUrls, box.managed ? (o.schemas?.length ? o.schemas : ['public']) : null, o.hostNetworkDump === true, () => {
+            hostNetworkUsed = true;
+          });
         }
         // Your files (or the restored dump) have run as superuser. They could have loosened pg_hba.conf and reloaded it.
         await box.checkAuth();
@@ -540,6 +545,7 @@ export async function createSandboxIsolation(o: SandboxIsolationOptions): Promis
       `Sandbox: the copies live in the container ${box.name} (image ${o.image}), reached on 127.0.0.1:${box.port}. ` +
         (box.isolated ? 'The container has no network at all (docker --network none). ' : 'The container is on the default Docker network, so it can reach this machine and the internet. ') +
         'The container is removed when the run ends.',
+      ...(hostNetworkUsed ? [`pg_dump ran in a second container (${box.name}-dump) on the HOST network, because the sandbox container could not reach your database on 127.0.0.1. That container runs only pg_dump (docker --entrypoint pg_dump) and is removed with the sandbox. The container that holds the copies is not on the host network.`] : []),
       ...iso.notes
     ];
     let disposed = false;
@@ -577,13 +583,33 @@ function tokenOf(name: string): string {
 }
 
 /** True when pg_isready, run inside the sandbox container, gets an answer from the source at the address the dump will use. */
-export function reachableFromContainer(sb: Sandbox, env: Record<string, string>): boolean {
+export function reachableFromContainer(sb: Sandbox, env: Record<string, string>): { code: number | null; stderr: string } {
   const r = docker(['exec', '-e', 'PGHOST', '-e', 'PGPORT', sb.name, 'pg_isready', '-t', '5'], sb.name, { PGHOST: env.PGHOST, PGPORT: env.PGPORT });
-  return r.code === 0 || r.code === 1; // 1: the server answered "rejecting connections". The dump will say why.
+  return { code: r.code, stderr: r.stderr };
+}
+
+/**
+ * Decides how pg_dump reaches a source on loopback. pg_isready exit codes: 0 accepting, 1 rejecting (the server answered),
+ * 2 no response, 3 no attempt was made. Only 2 means "the container cannot reach the source". Anything else that is not 0 or
+ * 1 (a docker failure, a missing program, a null code) is an error and stops the run: it must never turn host networking on.
+ * Host networking is used only when allowed (the default image, or --sandbox-host-network), else the run stops.
+ */
+export function decideDumpNetwork(code: number | null, stderr: string, allowHostNetwork: boolean): 'direct' | 'host' {
+  if (code === 0 || code === 1) return 'direct';
+  if (code !== 2) {
+    throw new Error(`sandbox: could not check whether the container can reach your database (pg_isready exit ${String(code)}: ${scrubSecrets(stderr.trim().split('\n').slice(-1)[0] ?? '', [])})`);
+  }
+  if (!allowHostNetwork) {
+    throw new Error(
+      'sandbox: the container cannot reach your database on 127.0.0.1 (normal on Docker Engine for Linux). The tool can run pg_dump in a second container on the host network, ' +
+        'but only for the default postgres image, or when you pass --sandbox-host-network for the image you chose. Without that, publish your database on an address the container can reach, or use --from-files.'
+    );
+  }
+  return 'host';
 }
 
 /** Copies the source into the master database inside the container: roles first, then pg_dump piped into psql. */
-async function dumpInto(sb: Sandbox, dbUrl: string, masterDb: string, urls: string[], onlySchemas: string[] | null): Promise<void> {
+async function dumpInto(sb: Sandbox, dbUrl: string, masterDb: string, urls: string[], onlySchemas: string[] | null, allowHostNetwork: boolean, onHostNetwork: () => void): Promise<void> {
   const u = new URL(dbUrl);
   const host = decodeURIComponent(u.hostname);
   if (!isLocalHost(host)) throw new Error('sandbox: the source host is not local');
@@ -627,12 +653,14 @@ async function dumpInto(sb: Sandbox, dbUrl: string, masterDb: string, urls: stri
   // loopback. Docker Engine for Linux does not: the name is the bridge gateway, and a service bound to 127.0.0.1 refuses a
   // connection that arrives there. So ask first, from inside the container. Only when the source is on loopback and the
   // container cannot reach it does pg_dump run in a helper container on the host network (see checkDumpHelper).
-  if (dumpEnv.PGHOST === 'host.docker.internal' && !reachableFromContainer(sb, dumpEnv)) {
+  const probe = dumpEnv.PGHOST === 'host.docker.internal' ? reachableFromContainer(sb, dumpEnv) : null;
+  if (probe && decideDumpNetwork(probe.code, probe.stderr, allowHostNetwork) === 'host') {
+    onHostNetwork();
     const helperName = `${sb.name}${DUMP_HELPER_SUFFIX}`;
     sb.helperUsed = true;
     startWatchdog(helperName, process.pid);
     producer = {
-      args: ['run', '--rm', '--name', helperName, '--label', `${LABEL_KEY}=1`, '--label', `${LABEL_HOST}=${hostId()}`, '--label', `${LABEL_PID}=${process.pid}`, '--label', `${LABEL_TOKEN}=${tokenOf(sb.name)}`, '--network', 'host', ...envNames.flatMap((v) => ['-e', v]), sb.image, 'pg_dump', ...dumpOpts],
+      args: ['run', '--rm', '--name', helperName, '--label', `${LABEL_KEY}=1`, '--label', `${LABEL_HOST}=${hostId()}`, '--label', `${LABEL_PID}=${process.pid}`, '--label', `${LABEL_TOKEN}=${tokenOf(sb.name)}`, '--network', 'host', ...envNames.flatMap((v) => ['-e', v]), '--entrypoint', 'pg_dump', sb.image, ...dumpOpts],
       env: { ...dumpEnv, PGHOST: decodeURIComponent(u.hostname).replace(/^\[|\]$/g, '') }
     };
   }

@@ -19,7 +19,8 @@ const portC = (v) => 55600 + Number(v);
 const nameC = (v) => `rls-saboteur-ci-cron-${v}`;
 const image = (v) => `rls-saboteur-ci-pg:${v}`;
 
-const SUPABASE_CI_IMAGE = 'public.ecr.aws/supabase/postgres:17.6.1.011';
+// Docker Hub, not ECR Public: ECR refused an anonymous pull from a runner ("Data limit exceeded").
+const SUPABASE_CI_IMAGE = 'supabase/postgres:17.6.1.011';
 function supabaseImageFor(v) {
   if (process.env.SABOTEUR_MATRIX_SUPABASE_IMAGE) return process.env.SABOTEUR_MATRIX_SUPABASE_IMAGE;
   return process.env.CI && v === '17' ? SUPABASE_CI_IMAGE : '';
