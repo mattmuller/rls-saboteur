@@ -4,6 +4,7 @@ import { Transform } from 'node:stream';
 import { withDatabase } from './config.js';
 import {
   CONTAINER_PREFIX,
+  DUMP_HELPER_SUFFIX,
   LABEL_HOST,
   LABEL_KEY,
   LABEL_PID,
@@ -47,6 +48,10 @@ export interface Sandbox {
   managed: boolean;
   /** Proves again that the server asks for a password. Run after anything of yours has run in the container. */
   checkAuth(): Promise<void>;
+  /** The image the container runs. */
+  image: string;
+  /** Set when the dump ran in a helper container on the host network. Removed with the sandbox. */
+  helperUsed: boolean;
   /** Removes the container. Returns true when it is gone. */
   remove(): Promise<boolean>;
 }
@@ -125,8 +130,10 @@ export async function startSandbox(image: string, token: string, isolated = fals
   const labels = ['--label', `${LABEL_KEY}=1`, '--label', `${LABEL_HOST}=${hostId()}`, '--label', `${LABEL_PID}=${process.pid}`, '--label', `${LABEL_TOKEN}=${token}`];
   const password = randomBytes(18).toString('hex');
   let relay: { port: number; close(): void } | undefined;
+  const box = { helperUsed: false };
   const remove = async (): Promise<boolean> => {
     relay?.close();
+    if (box.helperUsed) docker(['rm', '-f', '-v', `${name}${DUMP_HELPER_SUFFIX}`], name);
     docker(['rm', '-f', '-v', name], name);
     const gone = docker(['inspect', '--format', '{{.State.Running}}', name], name).code !== 0; // inspect fails once the container is gone
     return gone;
@@ -175,11 +182,18 @@ export async function startSandbox(image: string, token: string, isolated = fals
     return {
       checkAuth,
       managed,
+      image,
       name,
       isolated,
       port,
       user,
       password,
+      get helperUsed() {
+        return box.helperUsed;
+      },
+      set helperUsed(v: boolean) {
+        box.helperUsed = v;
+      },
       // The server speaks no TLS. The Supabase CLI insists on being told so.
       url: (db) => withDatabase(`postgres://${user}:${password}@127.0.0.1:${port}/postgres?sslmode=disable`, db),
       remove
@@ -555,6 +569,19 @@ export async function createSandboxIsolation(o: SandboxIsolationOptions): Promis
   }
 }
 
+/** The run token inside a sandbox container name. */
+function tokenOf(name: string): string {
+  const m = /-([0-9a-f]{16})$/.exec(name);
+  if (!m) throw new Error('sandbox: the container name has no run token');
+  return m[1];
+}
+
+/** True when pg_isready, run inside the sandbox container, gets an answer from the source at the address the dump will use. */
+export function reachableFromContainer(sb: Sandbox, env: Record<string, string>): boolean {
+  const r = docker(['exec', '-e', 'PGHOST', '-e', 'PGPORT', sb.name, 'pg_isready', '-t', '5'], sb.name, { PGHOST: env.PGHOST, PGPORT: env.PGPORT });
+  return r.code === 0 || r.code === 1; // 1: the server answered "rejecting connections". The dump will say why.
+}
+
 /** Copies the source into the master database inside the container: roles first, then pg_dump piped into psql. */
 async function dumpInto(sb: Sandbox, dbUrl: string, masterDb: string, urls: string[], onlySchemas: string[] | null): Promise<void> {
   const u = new URL(dbUrl);
@@ -590,20 +617,35 @@ async function dumpInto(sb: Sandbox, dbUrl: string, masterDb: string, urls: stri
     await pipeInto(sb, null, { args: psqlArgs(masterDb, false), input: onlySchemas.map((x) => `drop schema if exists ${qi(x)} cascade;`).join('\n') + '\n' }, urls);
   }
   const dumpEnv = dumpEnvFor(dbUrl);
+  const dumpOpts = ['--no-publications', '--no-subscriptions', '--no-tablespaces', ...(onlySchemas ?? []).map((x) => `--schema=${x}`)];
+  const envNames = ['PGPASSWORD', 'PGOPTIONS', 'PGHOST', 'PGPORT', 'PGUSER', 'PGDATABASE'];
+  let producer: { args: string[]; env: Record<string, string> } = {
+    args: ['exec', ...envNames.flatMap((v) => ['-e', v]), sb.name, 'pg_dump', ...dumpOpts],
+    env: dumpEnv
+  };
+  // The container reaches a loopback source through host.docker.internal. Docker Desktop forwards that name to the host's
+  // loopback. Docker Engine for Linux does not: the name is the bridge gateway, and a service bound to 127.0.0.1 refuses a
+  // connection that arrives there. So ask first, from inside the container. Only when the source is on loopback and the
+  // container cannot reach it does pg_dump run in a helper container on the host network (see checkDumpHelper).
+  if (dumpEnv.PGHOST === 'host.docker.internal' && !reachableFromContainer(sb, dumpEnv)) {
+    const helperName = `${sb.name}${DUMP_HELPER_SUFFIX}`;
+    sb.helperUsed = true;
+    startWatchdog(helperName, process.pid);
+    producer = {
+      args: ['run', '--rm', '--name', helperName, '--label', `${LABEL_KEY}=1`, '--label', `${LABEL_HOST}=${hostId()}`, '--label', `${LABEL_PID}=${process.pid}`, '--label', `${LABEL_TOKEN}=${tokenOf(sb.name)}`, '--network', 'host', ...envNames.flatMap((v) => ['-e', v]), sb.image, 'pg_dump', ...dumpOpts],
+      env: { ...dumpEnv, PGHOST: decodeURIComponent(u.hostname).replace(/^\[|\]$/g, '') }
+    };
+  }
   await pipeInto(
     sb,
-    {
-      args: ['exec', '-e', 'PGPASSWORD', '-e', 'PGOPTIONS', '-e', 'PGHOST', '-e', 'PGPORT', '-e', 'PGUSER', '-e', 'PGDATABASE', sb.name, 'pg_dump', '--no-publications', '--no-subscriptions', '--no-tablespaces', ...(onlySchemas ?? []).map((x) => `--schema=${x}`)],
-      env: dumpEnv
-    },
+    producer,
     { args: psqlArgs(masterDb, true) },
     urls,
     onlySchemas ? notValidForeignKeys(onlySchemas) : undefined
   ).catch((e: Error) => {
     throw new Error(
       `sandbox: loading the dump into the container failed:\n${e.message}${pgCronHint(e.message)}\n` +
-        `A source that uses extensions or schemas the image lacks needs a different --sandbox-image that asks for a password. ` +
-        `The Supabase Postgres image is refused, because it trusts loopback.`
+        `A source that uses extensions or schemas the image lacks needs a different --sandbox-image that asks for a password.`
     );
   });
 }

@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import pg from 'pg';
@@ -487,7 +488,14 @@ exit 0
 
   it('sandbox-isolated: in --from-files mode a migration cannot reach the host or the internet, and no port is published', async () => {
     await makeSource();
-    const port = new URL(superUrl!).port;
+    // The target is a listener on ALL interfaces of this machine, not the test Postgres. The Postgres is published on
+    // 127.0.0.1 only, and Docker Engine for Linux does not let a container on the bridge reach a loopback-only service
+    // (Docker Desktop does), so the control below could not connect there and proved nothing. A listener on 0.0.0.0 is
+    // reachable from the default network on both, which is what lets this test fail when the isolation is missing.
+    const listener = net.createServer((sock) => sock.end());
+    await new Promise<void>((res) => listener.listen(0, '0.0.0.0', res));
+    const port = String((listener.address() as net.AddressInfo).port);
+    try {
     const dir = join(scratch, 'isoproj');
     cpSync(project, dir, { recursive: true });
     const probe = (target: string): string => `copy reach_tmp from program 'timeout 4 bash -c "exec 3<>/dev/tcp/${target} && echo CONNECTED" 2>/dev/null || echo BLOCKED';`;
@@ -537,6 +545,31 @@ exit 0
     // Control: the same probe on the default network DOES connect to the host, so the test above can fail.
     const control = spawnSync('docker', ['run', '--rm', '--add-host', 'host.docker.internal:host-gateway', image!, 'bash', '-c', `timeout 4 bash -c "exec 3<>/dev/tcp/host.docker.internal/${port} && echo CONNECTED" 2>/dev/null || echo BLOCKED`], { encoding: 'utf8' });
     expect(control.stdout.trim()).toBe('CONNECTED');
+    } finally {
+      await new Promise<void>((res) => listener.close(() => res()));
+    }
+  });
+
+  it('sandbox-relay-no-leak: a client that vanishes without saying goodbye leaves no session open in the container', async () => {
+    const sb = await startSandbox(image!, newToken(), true);
+    try {
+      const sessions = (): number => {
+        const r = spawnSync('docker', ['exec', '-e', 'PGPASSWORD', sb.name, 'psql', '-X', '-At', '-h', '127.0.0.1', '-U', sb.user, '-d', 'postgres', '-c', "select count(*) from pg_stat_activity where datname = 'template1' and backend_type = 'client backend'"], { encoding: 'utf8', env: { ...process.env, PGPASSWORD: sb.password } });
+        expect(r.status, r.stderr).toBe(0);
+        return Number(r.stdout.trim());
+      };
+      expect(sessions()).toBe(0);
+      const c = new pg.Client({ connectionString: sb.url('template1') });
+      c.on('error', () => {});
+      await c.connect();
+      expect(sessions()).toBe(1);
+      // No Terminate message: the socket is cut, as a killed process or a dropped connection does.
+      (c as unknown as { connection: { stream: net.Socket } }).connection.stream.destroy();
+      expect(await until(() => sessions() === 0, 15_000)).toBe(true);
+    } finally {
+      await sb.remove();
+    }
+    expect(sandboxContainers()).toEqual([]);
   });
 
   it('sandbox-auth-relay: a wrong password through the relay is refused, and the right one is accepted', async () => {

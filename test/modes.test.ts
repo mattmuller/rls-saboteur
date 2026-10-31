@@ -59,6 +59,26 @@ describe('docker guard', () => {
     expect(() => checkDockerArgs(['port', name, '5432/tcp'], name)).not.toThrow();
     expect(() => checkDockerArgs(['rm', '-f', '-v', name], name)).not.toThrow();
   });
+  it('docker guard: the dump helper runs only pg_dump, on the host network, with the tool\'s labels', () => {
+    const env = ['PGPASSWORD', 'PGOPTIONS', 'PGHOST', 'PGPORT', 'PGUSER', 'PGDATABASE'].flatMap((v) => ['-e', v]);
+    const helper = `${name}-dump`;
+    const good = ['run', '--rm', '--name', helper, ...labels, '--network', 'host', ...env, 'postgres:17', 'pg_dump', '--no-publications', '--schema=public'];
+    expect(() => checkDockerArgs(good, name)).not.toThrow();
+    expect(() => checkDockerArgs(['rm', '-f', '-v', helper], name)).not.toThrow();
+    const bads: string[][] = [
+      good.map((x) => (x === 'pg_dump' ? 'psql' : x)),
+      [...good, '--file=/etc/passwd'],
+      [...good, '-f', '/x'],
+      good.map((x) => (x === 'host' ? 'bridge' : x)),
+      good.filter((x) => x !== '--rm'),
+      [...good.slice(0, good.indexOf('postgres:17')), '-v', '/:/h', 'postgres:17', 'pg_dump'],
+      good.map((x) => (x === helper ? `${name}-other` : x)),
+      good.map((x) => (x === 'PGPASSWORD' ? 'PATH' : x))
+    ];
+    for (const b of bads) expect(() => checkDockerArgs(b, name), b.join(' ')).toThrow(DockerGuardError);
+    // The helper name is accepted only for the sandbox of this run.
+    expect(() => checkDockerArgs(good, `rls-saboteur-sandbox-${hostId()}-1-${'a'.repeat(16)}`)).toThrow(DockerGuardError);
+  });
   it('docker guard: the files shape has no network at all, and nothing else is accepted in its place', () => {
     const none = ['run', '-d', '--rm', '--name', name, ...labels, '-e', 'POSTGRES_PASSWORD', '-e', 'POSTGRES_INITDB_ARGS', '--network', 'none', 'postgres:17'];
     expect(() => checkDockerArgs(none, name)).not.toThrow();

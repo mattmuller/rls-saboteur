@@ -19,6 +19,12 @@ const portC = (v) => 55600 + Number(v);
 const nameC = (v) => `rls-saboteur-ci-cron-${v}`;
 const image = (v) => `rls-saboteur-ci-pg:${v}`;
 
+const SUPABASE_CI_IMAGE = 'public.ecr.aws/supabase/postgres:17.6.1.011';
+function supabaseImageFor(v) {
+  if (process.env.SABOTEUR_MATRIX_SUPABASE_IMAGE) return process.env.SABOTEUR_MATRIX_SUPABASE_IMAGE;
+  return process.env.CI && v === '17' ? SUPABASE_CI_IMAGE : '';
+}
+
 function sh(cmd, args, opts = {}) {
   return spawnSync(cmd, args, { stdio: 'inherit', cwd: root, ...opts });
 }
@@ -79,15 +85,17 @@ try {
   }
   for (const v of started) {
     console.log(`\n=== PostgreSQL ${v} (port ${port(v)}) ===`);
-    const [vc, va] = niced('npx', ['vitest', 'run', '--config', 'vitest.matrix.config.ts']);
+    const [vc, va] = niced('npx', ['vitest', 'run', '--config', 'vitest.matrix.config.ts', ...process.argv.slice(2)]);
     const r = sh(vc, va, { env: {
       ...process.env,
       SABOTEUR_MATRIX_URL: `postgres://postgres:postgres@127.0.0.1:${port(v)}/postgres`,
       SABOTEUR_MATRIX_URL_B: `postgres://postgres:postgres@127.0.0.1:${portB(v)}/postgres`,
       SABOTEUR_MATRIX_URL_CRON: `postgres://postgres:postgres@127.0.0.1:${portC(v)}/postgres`,
       SABOTEUR_MATRIX_IMAGE: image(v),
-      // Optional: a local copy of the Supabase Postgres image turns on the Supabase tests. CI does not have it.
-      ...(process.env.SABOTEUR_MATRIX_SUPABASE_IMAGE ? { SABOTEUR_MATRIX_SUPABASE_IMAGE: process.env.SABOTEUR_MATRIX_SUPABASE_IMAGE } : {})
+      // The Supabase tests need the image. Set SABOTEUR_MATRIX_SUPABASE_IMAGE for a local copy. In CI (CI is set) the public
+      // image is pulled for the PostgreSQL 17 run, so those tests are not skipped there. The image is PostgreSQL 17, so the
+      // 16 run does not use it.
+      ...(supabaseImageFor(v) ? { SABOTEUR_MATRIX_SUPABASE_IMAGE: supabaseImageFor(v) } : {})
     } });
     if (r.status !== 0) failed = true;
   }

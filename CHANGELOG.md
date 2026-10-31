@@ -18,7 +18,14 @@ Four options from the roadmap. A run without the new options sends the same stat
 - The Supabase Postgres image works in sandbox mode. The tool replaces the image's `pg_hba.conf` (which trusts loopback) and proves the replacement with the same checks, so a run on an image that still lets a client in exits 2. With `--from-files`, and for a dump from an image that has them, the master is a clone of the image's own `postgres` database (schemas `auth`, `storage`, ...). A dump of a managed database covers only `--schemas` and creates foreign keys to other schemas `NOT VALID`. Tested end to end on a Supabase-shaped project. The Supabase CLI runner (`supabase test db`) does not reach the sandbox, so `--runner supabase` with `--sandbox` exits 2 and `psql` is the default there.
 - The guard allows one new statement, `CREATE DATABASE <own master> TEMPLATE template0`, only in build mode and only for the master.
 - A pg_cron section in the README, and a matrix test on PostgreSQL 16 and 17 with `pg_cron` preloaded. A scheduled job does not run in a copy.
+- CI now runs the four Supabase sandbox tests (the PostgreSQL 17 run pulls the public image). Before, they ran only where `SABOTEUR_MATRIX_SUPABASE_IMAGE` was set.
 - The matrix image now includes `pg_cron`, and the matrix starts a third server for it (`rls-saboteur-ci-cron-<version>`, port 55616 and 55617).
+
+### Fixed (found by the first run on Docker Engine for Linux, GitHub Actions)
+
+- Dump mode could not reach a source on `127.0.0.1` on Linux, because `host.docker.internal` is the bridge gateway there and does not reach loopback. The tool now checks with `pg_isready` from inside the container and, only if the source is on loopback and unreachable, runs `pg_dump` in a helper container on the host network, piped into the sandbox. The allowlist accepts that one shape, `pg_dump` only. On Docker Desktop nothing changes.
+- A relay connection that ended without the closing message stayed open in the container, because the relay's reader kept the socket after its writer ended. That could keep the master copy in use and fail the next copy with "source database ... is being accessed by other users". The relay now closes its end when its input ends, and waits for its reader so that the server does not take a signalled child for a crashed backend.
+- Test only: the `sandbox-isolated` control connected to a loopback-only database, which Linux Engine refuses. It now uses a listener on all interfaces.
 
 ### Changed
 

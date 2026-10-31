@@ -17,12 +17,23 @@ export const LABEL_HOST = 'rls-saboteur.host';
 export const LABEL_PID = 'rls-saboteur.pid';
 export const LABEL_TOKEN = 'rls-saboteur.token';
 
-/** The shell script `docker exec` runs in the container to carry one TCP connection to the server inside it. */
-export const RELAY_SCRIPT = 'exec 3<>/dev/tcp/127.0.0.1/5432 || exit 1; cat <&3 & cat >&3; exit 0';
+/**
+ * The shell script `docker exec` runs in the container to carry one TCP connection to the server inside it.
+ * When the client side ends (stdin closes), the script closes its end of the TCP connection too: it stops the reader and
+ * exits, so no copy of the socket is left open. Before, the reader (`cat <&3`) kept the socket open after stdin ended, and a
+ * session whose Terminate message was not delivered in time stayed connected for good. That kept the master template "in
+ * use" and failed the next CREATE DATABASE ... TEMPLATE on a Linux runner.
+ * The `wait` is not optional. The server is PID 1 in its container, so a child that outlives this shell is reparented to it,
+ * and the server treats a reaped child it does not know, killed by a signal, as a crashed backend and restarts every session.
+ */
+export const RELAY_SCRIPT = 'exec 3<>/dev/tcp/127.0.0.1/5432 || exit 1; cat <&3 & p=$!; cat >&3; kill $p 2>/dev/null; wait $p 2>/dev/null; exit 0';
 
 export function containerNameFor(host: string, pid: number, token: string): string {
   return `${CONTAINER_PREFIX}${host}-${pid}-${token}`;
 }
+
+/** Suffix of the helper container that runs pg_dump on the host network (Linux, loopback-only source). */
+export const DUMP_HELPER_SUFFIX = '-dump';
 
 export interface ContainerName {
   host: string;
@@ -31,7 +42,7 @@ export interface ContainerName {
 }
 
 export function parseContainerName(name: string): ContainerName | null {
-  const m = /^rls-saboteur-sandbox-([0-9a-f]{12})-(\d{1,10})-([0-9a-f]{16})$/.exec(name);
+  const m = /^rls-saboteur-sandbox-([0-9a-f]{12})-(\d{1,10})-([0-9a-f]{16})(?:-dump)?$/.exec(name);
   return m ? { host: m[1], pid: Number(m[2]), token: m[3] } : null;
 }
 
@@ -88,6 +99,7 @@ export function checkDockerArgs(args: string[], ownName: string): void {
   const same = (a: string[], b: string[]): boolean => a.length === b.length && a.every((x, i) => x === b[i]);
   switch (verb) {
     case 'run': {
+      if (rest[0] === '--rm' && rest[1] === '--name' && rest[2] === `${ownName}${DUMP_HELPER_SUFFIX}`) return checkDumpHelper(rest, ownName);
       // docker run -d --rm --name N --label k=v x4 -e POSTGRES_PASSWORD -e POSTGRES_INITDB_ARGS
       //   then either  -p 127.0.0.1::5432 --add-host host.docker.internal:host-gateway IMAGE   (rows come from a dump)
       //   or           --network none IMAGE                                                    (files mode: no network at all)
@@ -148,6 +160,31 @@ export function checkDockerArgs(args: string[], ownName: string): void {
     }
   }
   throw new DockerGuardError(`this docker command is not one the tool sends: docker ${args.slice(0, 3).join(' ')}${args.length > 3 ? ' ...' : ''}`);
+}
+
+/**
+ * The second container shape. On Docker Engine for Linux a container on the bridge cannot reach a database that listens on
+ * 127.0.0.1 of the host. For that one case only, pg_dump runs in a helper container on the host network, and its output is
+ * piped into the sandbox. The helper holds no password of its own, runs nothing but pg_dump with a fixed set of options, is
+ * labelled like the sandbox so the sweep and the watchdog cover it, and is removed when it ends (--rm).
+ *   docker run --rm --name NAME-dump --label x4 --network host -e PGPASSWORD -e PGOPTIONS -e PGHOST -e PGPORT -e PGUSER
+ *     -e PGDATABASE IMAGE pg_dump [--no-publications] [--no-subscriptions] [--no-tablespaces] [--schema=NAME]...
+ */
+function checkDumpHelper(rest: string[], ownName: string): void {
+  const same = (a: string[], b: string[]): boolean => a.length === b.length && a.every((x, i) => x === b[i]);
+  const id = parseContainerName(ownName);
+  if (!id) throw new DockerGuardError('the dump helper needs a sandbox container name');
+  const head = ['--rm', '--name', `${ownName}${DUMP_HELPER_SUFFIX}`, '--label', `${LABEL_KEY}=1`, '--label', `${LABEL_HOST}=${id.host}`, '--label', `${LABEL_PID}=${id.pid}`, '--label', `${LABEL_TOKEN}=${id.token}`, '--network', 'host'];
+  const env = ['PGPASSWORD', 'PGOPTIONS', 'PGHOST', 'PGPORT', 'PGUSER', 'PGDATABASE'].flatMap((v) => ['-e', v]);
+  const want = [...head, ...env];
+  if (!same(rest.slice(0, want.length), want)) throw new DockerGuardError('the dump helper has a shape the tool does not send');
+  const image = rest[want.length];
+  if (!image || image.startsWith('-') || !IMAGE_PATTERN.test(image)) throw new DockerGuardError('the dump helper image is not a plain image name');
+  if (rest[want.length + 1] !== 'pg_dump') throw new DockerGuardError('the dump helper may run only pg_dump');
+  const fixed = new Set(['--no-publications', '--no-subscriptions', '--no-tablespaces']);
+  for (const a of rest.slice(want.length + 2)) {
+    if (!fixed.has(a) && !/^--schema=[^\s\u0000]+$/.test(a)) throw new DockerGuardError(`the dump helper may not pass "${a.slice(0, 20)}" to pg_dump`);
+  }
 }
 
 export interface DockerResult {
