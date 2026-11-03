@@ -20,10 +20,13 @@ npm ci
 | `npm test` | Runs the unit tests with vitest. No database is needed. |
 | `npm run test:matrix` | Builds the CLI, starts throwaway PostgreSQL 16 and 17 servers in Docker, and runs the end-to-end tests. Takes several minutes. |
 | `npm run build` | Compiles `src/` into `dist/`. |
+| `npm run test:e2e` | Runs the end-to-end tests against a local Postgres. Set `SABOTEUR_E2E_URL` first. |
 
 Run type-check, test and build before you open a pull request. Run `test:matrix` as well when you touch `src/guard.ts`, `src/isolation.ts`, `src/tests.ts` or `src/cli.ts`. CI runs the unit tests on Node 22 and 24, and the matrix on PostgreSQL 16 and 17.
 
 `npm run test:matrix` creates only containers named `rls-saboteur-ci-*`, on ports 55416, 55417, 55516 and 55517. It never touches another container or a volume.
+
+`npm run test:matrix` needs Docker. It starts and removes `rls-saboteur-ci-16`, `rls-saboteur-ci-17`, `rls-saboteur-ci-b-*` and `rls-saboteur-ci-cron-*`, and the sandbox containers its tests start.
 
 ## House rules
 
@@ -31,7 +34,7 @@ Run type-check, test and build before you open a pull request. Run `test:matrix`
 
 **2. Prove every new test can fail.** Break the code the test covers. Run the test. See it go red. Restore the code. A test that has never failed may check nothing, and this project exists to catch that mistake. Write "yes" in the pull request template when you did this.
 
-**3. Name the test for each guarantee.** The README lists each guarantee with the exact name of the test that checks it. If you rename a test, update the README. If you add a guarantee, add the test first.
+**3. Name the test for each guarantee.** [docs/safety.md](docs/safety.md) lists each guarantee with the exact name of the test that checks it. If you rename a test, update that page. If you add a guarantee, add the test first.
 
 **4. Keep the project generic.** Examples, fixtures and docs use neutral subjects such as organisations, documents and invoices. Use no company, product or other project names.
 
