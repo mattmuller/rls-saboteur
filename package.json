@@ -10,7 +10,7 @@
   "bugs": "https://github.com/mattmuller/rls-saboteur/issues",
   "keywords": ["postgres", "supabase", "rls", "row-level-security", "mutation-testing", "pgtap"],
   "bin": { "rls-saboteur": "dist/cli.js" },
-  "files": ["dist", "README.md", "LICENSE"],
+  "files": ["dist", "docs", "README.md", "LICENSE"],
   "engines": { "node": ">=22" },
   "scripts": {
     "build": "tsc -p tsconfig.build.json && chmod +x dist/cli.js",
