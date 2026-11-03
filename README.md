@@ -56,7 +56,7 @@ Not on Supabase? See [Plain Postgres](docs/plain-postgres.md). On a local Supaba
 ## What it will never do
 
 - It never changes the database you point it at. It reads it, and copies the rows into temporary databases that it drops afterwards.
-- It refuses a database that is not local, unless you pass a flag whose name says it locks tables.
+- It refuses a database that is not local, unless you pass `--allow-remote-i-understand-this-locks-tables`.
 - It never closes your connections without a separate yes.
 - It never copies a source over 2 GB unless you pass `--max-size`.
 - It switches off outbound HTTP in the copies by default.
