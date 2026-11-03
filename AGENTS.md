@@ -12,7 +12,7 @@ RLS Saboteur breaks each Postgres RLS policy in a throwaway copy of the database
 ### Commands
 
 ```sh
-npx rls-saboteur --dry-run --json        # list the breaks and stop; changes nothing
+npx rls-saboteur --dry-run               # list the breaks as text on stdout and stop; no tests run, no JSON
 npx rls-saboteur --yes --json            # full run, no prompt, JSON on stdout
 npx rls-saboteur --checks-only --json    # only the checks that need no tests
 ```
@@ -24,6 +24,7 @@ npx rls-saboteur --checks-only --json    # only the checks that need no tests
 ### Inputs and approval
 
 - You have no terminal to answer the plan question. Pass `--yes`, and only for a run whose plan you have read (`--dry-run` shows the breaks).
+- `--dry-run` writes plain text only. It never writes JSON. With `--json` its text goes to stderr and stdout stays empty. For JSON, run without `--dry-run`.
 - `--yes` approves the plan and a test command from `.rls-saboteur.json`. It does not approve closing other sessions on the database. That needs `--close-sessions`. Pass it only on a local database you started yourself.
 - Without a terminal and without `--yes`, the tool exits 2 and names `--yes`.
 - `--test "<command>"` and the `test` value in `.rls-saboteur.json` run as shell commands. Do not run the tool with a config file you have not read.
@@ -66,7 +67,7 @@ The Claude Code plugin in `plugin/` does this loop. Install it with `/plugin mar
 - It refuses a database that is not local. Do not pass `--allow-remote-i-understand-this-locks-tables`.
 - Do not pass `--no-isolate-network`. It turns outbound HTTP on inside the copies.
 - A source over 2 GB needs `--max-size`. Ask the user before you raise it.
-- The copies hold the same rows as the source. To keep real rows out, use `--sandbox --from-files` or `--mask`. See [docs/sandbox.md](docs/sandbox.md).
+- The copies hold the same rows as the source. To keep real rows out, use `--sandbox --from-files`: it reads no real row. `--mask` is not a privacy control and does not make real personal data safe to share; it only rewrites the columns you name in the first copy. See [docs/sandbox.md](docs/sandbox.md).
 - Do not add a skip to `.rls-saboteur.json` to make a run pass. Every skip needs a written reason.
 
 ### HOL Guard
